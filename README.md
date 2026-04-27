@@ -65,6 +65,16 @@ bash train_tpu_colab_smoke.sh
 
 See `TPU_COLAB.md` for the real-data follow-up command.
 
+With real data in a local `val/` directory, run:
+
+```bash
+export PJRT_DEVICE=TPU
+bash train.sh
+```
+
+`train.sh` uses `val/` as both `train/` and `val/` for a pipeline smoke test if
+no separate `train/` directory is present.
+
 ## CUDA Training Example
 
 ```bash

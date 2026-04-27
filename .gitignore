@@ -13,6 +13,9 @@ env/
 
 # Local data and training outputs
 data/
+/train/
+/val/
+.tpu_real_data/
 smoke_data/
 smoke_run/
 tpu_smoke_data/

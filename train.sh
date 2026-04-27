@@ -1,20 +1,60 @@
 #!/bin/bash
-# Multi-GPU DDP: uncomment MULTI_GPUS below, batch-size is per-GPU
-MULTI_GPUS="--multi-gpus 0,1,2,3,4,5,6,7"
-# MULTI_GPUS=""
+set -euo pipefail
 
-python3 -u train.py \
-    --traindir ../data/train/nano_test \
-    --datadir ../data/shuffleddata/kata1_trainingdata_25q4_2601 \
-    --pos-len 19 \
-    --batch-size 1024 \
-    --model-kind b12c768 \
-    --lr 2e-4 \
-    --max-training-samples 300000000 \
-    --symmetry-type xyt \
-    --print-every 1 \
-    --save-every-samples 1000000 \
-    --val-every-samples 1000000 \
-    --warmup-samples 2000000 \
-    --enable-history-matrices \
-    ${MULTI_GPUS}
+# TPU v6e-1 real-data smoke training.
+#
+# Expected data layout for train.py:
+#   DATADIR/
+#     train/*.npz
+#     val/*.npz
+#
+# If this repo only has ./val with real data, this script creates a temporary
+# ./.tpu_real_data directory where both train/ and val/ point at ./val. That is
+# useful for testing the full training pipeline, but not for real experiments.
+
+cd "$(dirname "$0")"
+
+export PJRT_DEVICE="${PJRT_DEVICE:-TPU}"
+
+if [ -n "${DATADIR:-}" ]; then
+    DATA_ROOT="${DATADIR}"
+elif [ -d "./train" ] && [ -d "./val" ]; then
+    DATA_ROOT="."
+elif [ -d "./val" ]; then
+    DATA_ROOT="./.tpu_real_data"
+    rm -rf "${DATA_ROOT}"
+    mkdir -p "${DATA_ROOT}"
+    ln -s "$(pwd)/val" "${DATA_ROOT}/train"
+    ln -s "$(pwd)/val" "${DATA_ROOT}/val"
+    echo "Using ./val for both train/ and val/ under ${DATA_ROOT} (smoke test only)."
+else
+    echo "ERROR: expected DATADIR with train/ and val/, or a local ./val directory." >&2
+    exit 1
+fi
+
+EXTRA_FLAGS=()
+if [ "${ENABLE_HISTORY_MATRICES:-1}" != "0" ]; then
+    EXTRA_FLAGS+=(--enable-history-matrices)
+fi
+
+python -u train.py \
+    --device xla \
+    --traindir "${TRAINDIR:-./tpu_real_run}" \
+    --datadir "${DATA_ROOT}" \
+    --pos-len "${POS_LEN:-19}" \
+    --batch-size "${BATCH_SIZE:-16}" \
+    --model-kind "${MODEL_KIND:-b12c192}" \
+    --lr "${LR:-2e-4}" \
+    --max-training-samples "${MAX_TRAINING_SAMPLES:-1024}" \
+    --symmetry-type "${SYMMETRY_TYPE:-xyt}" \
+    --print-every "${PRINT_EVERY:-1}" \
+    --save-every-samples "${SAVE_EVERY_SAMPLES:-1024}" \
+    --val-every-samples "${VAL_EVERY_SAMPLES:-1024}" \
+    --warmup-samples "${WARMUP_SAMPLES:-256}" \
+    --prefetch-batches 0 \
+    --no-compile \
+    --no-tensorboard \
+    --amp-dtype "${AMP_DTYPE:-bf16}" \
+    --seed "${SEED:-1234}" \
+    "${EXTRA_FLAGS[@]}" \
+    "$@"

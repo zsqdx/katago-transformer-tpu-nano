@@ -79,6 +79,26 @@ After the smoke test passes, run the real loader with conservative settings:
 
 ```bash
 export PJRT_DEVICE=TPU
+bash train.sh
+```
+
+`train.sh` expects either:
+
+- `DATADIR` pointing to a directory with `train/` and `val/` subdirectories, or
+- a local `./val` directory. If only `./val` exists, the script uses it for both
+  training and validation as a pipeline smoke test.
+
+The script defaults to `model-kind=b12c192`, `batch-size=16`, and
+`max-training-samples=1024`. Override them with environment variables:
+
+```bash
+BATCH_SIZE=32 MAX_TRAINING_SAMPLES=4096 bash train.sh
+```
+
+For reference, the command expanded by `train.sh` is equivalent to:
+
+```bash
+export PJRT_DEVICE=TPU
 python -u train.py \
   --device xla \
   --traindir ./tpu_real_run \
