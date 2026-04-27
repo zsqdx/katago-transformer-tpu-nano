@@ -116,6 +116,7 @@ python -u train.py \
   --prefetch-batches 0 \
   --no-compile \
   --no-tensorboard \
+  --allow-nonfull-mask \
   --amp-dtype bf16
 ```
 

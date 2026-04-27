@@ -60,6 +60,7 @@ def read_npz_training_data(
     use_pin_memory: bool = False,
     seed=None,
     varlen: bool = False,
+    allow_nonfull_mask: bool = False,
 ):
     if seed is not None:
         rand = np.random.default_rng(seed=seed)
@@ -112,10 +113,14 @@ def read_npz_training_data(
 
         assert binaryInputNCHW.shape[1] == num_bin_features
         assert globalInputNC.shape[1] == num_global_features
-        # Channel 0 is the on-board mask. When varlen is disabled, it must be all-ones.
-        if not varlen:
-            assert np.all(binaryInputNCHW[:, 0, :, :] == 1), \
-                f"Channel 0 (on-board mask) must be all 1 for full-resolution input in {npz_file}"
+        # Channel 0 is the on-board mask. Some older real datasets have legacy
+        # mask contents even for fixed-size 19x19 data, so allow compatibility.
+        if not varlen and not allow_nonfull_mask and not np.all(binaryInputNCHW[:, 0, :, :] == 1):
+            logging.warning(
+                "Channel 0 (on-board mask) is not all 1 in %s. Continuing in legacy "
+                "fixed-board mode; use --allow-nonfull-mask to silence this warning.",
+                npz_file,
+            )
         return (npz_file, binaryInputNCHW, globalInputNC, policyTargetsNCMove, globalTargetsNC, scoreDistrN, valueTargetsNCHW, metadataInputNC, qValueTargetsNCMove)
 
     if not npz_files:

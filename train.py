@@ -968,6 +968,7 @@ def main(rank, world_size, args, gpu_id):
             use_pin_memory=use_pin_memory,
             seed=args.seed + rank if args.seed is not None else None,
             varlen=args.varlen,
+            allow_nonfull_mask=args.allow_nonfull_mask,
         )
         profiler.tick()
         for batch in data_processing.prefetch_generator(train_gen, args.prefetch_batches):
@@ -1221,6 +1222,7 @@ def main(rank, world_size, args, gpu_id):
                                 model_config=model_config,
                                 use_pin_memory=use_pin_memory,
                                 varlen=args.varlen,
+                                allow_nonfull_mask=args.allow_nonfull_mask,
                             )
                             for val_batch in data_processing.prefetch_generator(val_gen, args.prefetch_batches):
                                 with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
@@ -1351,6 +1353,8 @@ if __name__ == "__main__":
                         help="EMA decay rate for model params (0=disabled, typical: 0.999 or 0.9999)")
     parser.add_argument("--varlen", action="store_true",
                         help="Enable variable-length board input with masking")
+    parser.add_argument("--allow-nonfull-mask", action="store_true",
+                        help="Allow legacy fixed-board data whose channel-0 mask is not all ones")
     parser.add_argument("--gated-attn", action="store_true",
                         help="Enable elementwise gated attention (sigmoid gate on attention output)")
     parser.add_argument("--zero-centered-norm", action="store_true",
