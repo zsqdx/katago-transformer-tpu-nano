@@ -6,6 +6,8 @@ set -euo pipefail
 # _XLAC undefined-symbol import errors.
 
 TORCH_XLA_VERSION="${TORCH_XLA_VERSION:-2.9.0}"
+PIP_RETRIES="${PIP_RETRIES:-10}"
+PIP_TIMEOUT="${PIP_TIMEOUT:-1000}"
 
 python - <<'PY'
 import sys
@@ -14,8 +16,17 @@ PY
 
 python -m pip uninstall -y torch_xla torch torchvision torchaudio libtpu || true
 
-python -m pip install --no-cache-dir --force-reinstall \
-    "torch==${TORCH_XLA_VERSION}" \
+python -m pip install --upgrade pip
+
+# Use the official PyTorch CPU wheel index. TPU/XLA does not need the large
+# CUDA-enabled PyPI torch wheel, and Colab downloads are prone to timeouts.
+python -m pip install --retries "${PIP_RETRIES}" --timeout "${PIP_TIMEOUT}" --force-reinstall \
+    --index-url https://download.pytorch.org/whl/cpu \
+    "torch==${TORCH_XLA_VERSION}"
+
+# Install XLA and TPU runtime deps from PyPI. The CPU torch wheel above
+# satisfies torch_xla's torch dependency without pulling CUDA packages.
+python -m pip install --retries "${PIP_RETRIES}" --timeout "${PIP_TIMEOUT}" --force-reinstall \
     "torch_xla[tpu]==${TORCH_XLA_VERSION}" \
     numpy \
     tensorboard

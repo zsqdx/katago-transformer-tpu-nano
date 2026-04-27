@@ -17,6 +17,8 @@ bash colab_install_torch_xla.sh
 
 This pins `torch` and `torch_xla` to the same release. That matters because an
 ABI mismatch shows up as an `_XLAC` undefined-symbol import error.
+The installer uses the official PyTorch CPU wheel index for `torch`, avoiding
+the much larger CUDA wheel that PyPI may otherwise select on Colab.
 
 Restart the runtime if Colab asks you to after installation, or if a notebook
 cell has already imported `torch` before the reinstall.
@@ -54,6 +56,14 @@ different matched release:
 
 ```bash
 TORCH_XLA_VERSION=2.9.0 bash colab_install_torch_xla.sh
+```
+
+If a download times out, rerun the same command. The script keeps pip's cache
+enabled and uses longer retry/timeout settings. For a particularly flaky Colab
+session, you can increase them:
+
+```bash
+PIP_RETRIES=20 PIP_TIMEOUT=2000 bash colab_install_torch_xla.sh
 ```
 
 ## Real Data Test
