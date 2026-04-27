@@ -7,6 +7,9 @@ This is the first TPU path for `nano/train.py`. It is intentionally narrow:
 - AdamW only
 - no TransformerEngine, FP8, CUDA profiler, `torch.compile`, DDP, or ZeRO
 
+Validated on Colab TPU v6e-1 with Python 3.12, `torch==2.9.0+cpu`,
+`torch_xla==2.9.0`, and `libtpu==0.0.21`.
+
 ## Colab Setup
 
 Select a TPU runtime in Colab, preferably `v6e-1`, then run:
@@ -33,6 +36,10 @@ bash train_tpu_colab_smoke.sh
 
 The script generates tiny synthetic data in `./tpu_smoke_data` and trains a
 small 1-layer model into `./tpu_smoke_run`.
+
+The first few optimizer steps may take several seconds while XLA traces and
+compiles the graph. Later steps should get much faster once the compiled graph
+is cached.
 
 ## Fixing `_XLAC` Import Errors
 

@@ -13,6 +13,8 @@ training loop can be iterated on independently.
 - The TPU path is intended for Colab `v6e-1` first, using AdamW only.
 - TransformerEngine, FP8, CUDA profiling, ZeRO, multi-GPU DDP, and
   `torch.compile` are not enabled on XLA yet.
+- Colab TPU v6e-1 smoke test has passed with Python 3.12,
+  `torch==2.9.0+cpu`, and `torch_xla==2.9.0`.
 
 ## Files
 
