@@ -56,8 +56,8 @@ python -u train.py \
 In a Colab TPU runtime:
 
 ```bash
-pip install -U torch torch_xla[tpu]
 export PJRT_DEVICE=TPU
+bash colab_install_torch_xla.sh
 bash train_tpu_colab_smoke.sh
 ```
 

@@ -12,10 +12,14 @@ This is the first TPU path for `nano/train.py`. It is intentionally narrow:
 Select a TPU runtime in Colab, preferably `v6e-1`, then run:
 
 ```bash
-pip install -U torch torch_xla[tpu]
+bash colab_install_torch_xla.sh
 ```
 
-Restart the runtime if Colab asks you to after installation.
+This pins `torch` and `torch_xla` to the same release. That matters because an
+ABI mismatch shows up as an `_XLAC` undefined-symbol import error.
+
+Restart the runtime if Colab asks you to after installation, or if a notebook
+cell has already imported `torch` before the reinstall.
 
 Clone or upload this repository, then:
 
@@ -27,6 +31,30 @@ bash train_tpu_colab_smoke.sh
 
 The script generates tiny synthetic data in `./tpu_smoke_data` and trains a
 small 1-layer model into `./tpu_smoke_run`.
+
+## Fixing `_XLAC` Import Errors
+
+If `import torch_xla` fails with an error like:
+
+```text
+ImportError: ... _XLAC...so: undefined symbol ...
+```
+
+then Colab has loaded incompatible `torch` and `torch_xla` wheels. Reinstall
+the matching pair and rerun the smoke test:
+
+```bash
+cd /content/katago-transformer-tpu-nano
+bash colab_install_torch_xla.sh
+bash train_tpu_colab_smoke.sh
+```
+
+The installer defaults to `2.9.0`, which supports Python 3.12 wheels. To try a
+different matched release:
+
+```bash
+TORCH_XLA_VERSION=2.9.0 bash colab_install_torch_xla.sh
+```
 
 ## Real Data Test
 

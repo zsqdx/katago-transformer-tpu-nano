@@ -1,4 +1,4 @@
 numpy
-torch
-torch_xla[tpu]
+torch==2.9.0
+torch_xla[tpu]==2.9.0
 tensorboard

@@ -2,16 +2,34 @@
 set -euo pipefail
 
 # Run from the nano/ directory on a Colab v6e-1 TPU runtime.
-# If torch_xla is missing, install the matching PyTorch/XLA package first:
-#   pip install -U torch torch_xla[tpu]
+# If torch_xla fails to import with an _XLAC undefined symbol error, run:
+#   bash colab_install_torch_xla.sh
 
 export PJRT_DEVICE="${PJRT_DEVICE:-TPU}"
 
 python - <<'PY'
-import torch
-import torch_xla
-print("torch", torch.__version__)
-print("torch_xla", torch_xla.__version__)
+import importlib.metadata as md
+import sys
+
+print("python", sys.version.replace("\n", " "))
+for package in ("torch", "torch_xla", "libtpu"):
+    try:
+        print(package, md.version(package))
+    except md.PackageNotFoundError:
+        print(package, "not installed")
+
+try:
+    import torch
+    import torch_xla
+except Exception as exc:
+    print("\nFailed to import torch_xla. This usually means torch and torch_xla are ABI-mismatched.")
+    print("Repair command:")
+    print("  bash colab_install_torch_xla.sh")
+    raise SystemExit(1) from exc
+
+print("torch import", torch.__version__)
+print("torch_xla import", torch_xla.__version__)
+print("xla device", torch.tensor(1.0, device="xla").device)
 PY
 
 python make_smoke_data.py \
