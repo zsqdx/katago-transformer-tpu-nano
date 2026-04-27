@@ -36,6 +36,33 @@ python -m pip install --retries "${PIP_RETRIES}" --timeout "${PIP_TIMEOUT}" --fo
     numpy \
     tensorboard
 
+# Some Colab Python 3.12 images leave a regular google package at
+# site-packages/google/__init__.py. That breaks google.protobuf namespace
+# imports used by tpu-info and can still trigger pkgutil.ImpImporter errors even
+# after setuptools is upgraded. Remove only this namespace-conflict file/cache.
+python - <<'PY'
+import pathlib
+import shutil
+import site
+import sysconfig
+
+roots = set(site.getsitepackages())
+purelib = sysconfig.get_path("purelib")
+if purelib:
+    roots.add(purelib)
+
+for root in sorted(roots):
+    google_dir = pathlib.Path(root) / "google"
+    init_py = google_dir / "__init__.py"
+    pycache = google_dir / "__pycache__"
+    if init_py.exists():
+        print(f"Removing legacy google namespace stub: {init_py}")
+        init_py.unlink()
+    if pycache.exists():
+        print(f"Removing google namespace cache: {pycache}")
+        shutil.rmtree(pycache)
+PY
+
 python - <<'PY'
 import importlib.metadata as md
 import torch
@@ -49,5 +76,7 @@ except md.PackageNotFoundError:
     print("libtpu package metadata not found")
 print("xla device", torch.tensor(1.0, device="xla").device)
 PY
+
+tpu-info --version || true
 
 echo "PyTorch/XLA install check passed. If this was run inside a notebook cell, restart the runtime once if later imports still see the old torch."

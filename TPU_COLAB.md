@@ -50,7 +50,10 @@ Colab/libtpu runtime exposes them.
 
 ```python
 import pathlib
+import shutil
+import site
 import sys
+import sysconfig
 import subprocess
 import time
 from IPython.display import clear_output
@@ -73,15 +76,37 @@ def run(cmd, timeout=10):
 def short_error(text, max_lines=12):
     if "pkgutil.ImpImporter" in text or "pkg_resources" in text:
         return (
-            "tpu-info failed because Colab is using an old pkg_resources "
-            "package that is incompatible with Python 3.12.\n"
+            "tpu-info failed because Colab has a stale Python 3.12 package "
+            "layout: old pkg_resources and/or a regular google/__init__.py "
+            "that breaks google.protobuf namespace imports.\n"
             "This cell tried to repair it with:\n"
             "  python -m pip install -U 'setuptools>=70' wheel\n"
-            "If the error remains, run that command once in a separate cell "
+            "  rm -f /usr/local/lib/python3.12/dist-packages/google/__init__.py\n"
+            "  rm -rf /usr/local/lib/python3.12/dist-packages/google/__pycache__\n"
+            "If the error remains, run those commands once in a separate cell "
             "and restart the runtime."
         )
     lines = [line for line in text.splitlines() if line.strip()]
     return "\n".join(lines[-max_lines:]) if lines else "(no output)"
+
+def remove_legacy_google_init():
+    roots = set(site.getsitepackages())
+    purelib = sysconfig.get_path("purelib")
+    if purelib:
+        roots.add(purelib)
+
+    removed = []
+    for root in sorted(roots):
+        google_dir = pathlib.Path(root) / "google"
+        init_py = google_dir / "__init__.py"
+        pycache = google_dir / "__pycache__"
+        if init_py.exists():
+            init_py.unlink()
+            removed.append(str(init_py))
+        if pycache.exists():
+            shutil.rmtree(pycache)
+            removed.append(str(pycache))
+    return removed
 
 def ensure_tpu_info():
     global TPU_INFO_READY, TPU_INFO_ERROR, TPU_INFO_REPAIRED
@@ -108,6 +133,7 @@ def ensure_tpu_info():
                 [sys.executable, "-m", "pip", "install", "-q", "--upgrade", "setuptools>=70", "wheel"],
                 timeout=120,
             )
+            removed = remove_legacy_google_init()
             probe = run(["tpu-info", "--version"])
         except Exception as exc:
             TPU_INFO_READY = False
@@ -117,7 +143,7 @@ def ensure_tpu_info():
             TPU_INFO_READY = True
             TPU_INFO_ERROR = ""
             return True
-        output = repair.stdout + "\n" + probe.stdout
+        output = repair.stdout + "\nRemoved: " + ", ".join(removed) + "\n" + probe.stdout
 
     TPU_INFO_READY = False
     TPU_INFO_ERROR = short_error(output)
@@ -180,6 +206,9 @@ repair attempt, run this once and restart the Colab runtime:
 
 ```bash
 python -m pip install -U "setuptools>=70" wheel
+rm -f /usr/local/lib/python3.12/dist-packages/google/__init__.py
+rm -rf /usr/local/lib/python3.12/dist-packages/google/__pycache__
+tpu-info
 ```
 
 ## Fixing `_XLAC` Import Errors
