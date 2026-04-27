@@ -328,6 +328,13 @@ MAX_TRAINING_SAMPLES=65536 \
 WARMUP_SAMPLES=8192 \
 TRAINDIR=./tpu_real_run_b12c1024_b32 \
 bash train.sh
+
+MODEL_KIND=b12c1536 \
+BATCH_SIZE=16 \
+MAX_TRAINING_SAMPLES=32768 \
+WARMUP_SAMPLES=4096 \
+TRAINDIR=./tpu_real_run_b12c1536_b16 \
+bash train.sh
 ```
 
 For each width, compare only stable windows after `xla_compile=0.0s/0`. If the

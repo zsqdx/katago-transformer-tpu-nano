@@ -85,8 +85,8 @@ transfer to XLA to avoid repeated training-graph compilation. For throughput
 experiments, `train.sh` also exposes `GRAD_ACCUM_STEPS` and `GRAD_CLIP_NORM`
 environment overrides.
 
-Available TPU width presets include `b12c512`, `b12c768`, and `b12c1024` for
-checking whether a wider trunk improves TPU utilization over the default
+Available TPU width presets include `b12c512`, `b12c768`, `b12c1024`, and
+`b12c1536` for checking whether a wider trunk improves TPU utilization over the default
 `b12c192`.
 
 ## CUDA Training Example
