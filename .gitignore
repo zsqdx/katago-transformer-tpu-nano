@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local data and training outputs
+data/
+smoke_data/
+smoke_run/
+tpu_smoke_data/
+tpu_smoke_run/
+tpu_real_run/
+*_smoke_data*/
+*_smoke_run*/
+tb_logs/
+*.log
+
+# Model artifacts and large generated files
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.engine
+*.bin.gz
+*.npz
+
+# Test/generated model folders
+test/models/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
