@@ -42,17 +42,17 @@ python -u train.py \
     --traindir "${TRAINDIR:-./tpu_real_run}" \
     --datadir "${DATA_ROOT}" \
     --pos-len "${POS_LEN:-19}" \
-    --batch-size "${BATCH_SIZE:-64}" \
+    --batch-size "${BATCH_SIZE:-256}" \
     --model-kind "${MODEL_KIND:-b12c192}" \
     --lr "${LR:-2e-4}" \
     --lr-schedule "${LR_SCHEDULE:-cosine}" \
-    --max-training-samples "${MAX_TRAINING_SAMPLES:-65536}" \
+    --max-training-samples "${MAX_TRAINING_SAMPLES:-262144}" \
     --symmetry-type "${SYMMETRY_TYPE:-xyt}" \
     --print-every "${PRINT_EVERY:-20}" \
-    --save-every-samples "${SAVE_EVERY_SAMPLES:-16384}" \
-    --val-every-samples "${VAL_EVERY_SAMPLES:-16384}" \
+    --save-every-samples "${SAVE_EVERY_SAMPLES:-65536}" \
+    --val-every-samples "${VAL_EVERY_SAMPLES:-65536}" \
     --max-val-batches "${MAX_VAL_BATCHES:-16}" \
-    --warmup-samples "${WARMUP_SAMPLES:-8192}" \
+    --warmup-samples "${WARMUP_SAMPLES:-32768}" \
     --prefetch-batches 0 \
     --no-compile \
     --no-tensorboard \

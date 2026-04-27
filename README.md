@@ -74,11 +74,11 @@ bash train.sh
 
 `train.sh` uses `val/` as both `train/` and `val/` for a pipeline smoke test if
 no separate `train/` directory is present. It now defaults to a moderate TPU
-run: batch size 64, 65,536 training samples, 8,192 warmup samples, cosine LR,
-and validation capped to 16 batches. Validation metrics are accumulated on the
-device and copied back once per print window or validation pass. On TPU, random
-symmetries and history matrix preprocessing are applied before transfer to XLA
-to avoid repeated training-graph compilation.
+run: batch size 256, 262,144 training samples, 32,768 warmup samples, cosine
+LR, and validation capped to 16 batches. Validation metrics are accumulated on
+the device and copied back once per print window or validation pass. On TPU,
+AdamW uses capturable step tensors, and random symmetries/history preprocessing
+are applied before transfer to XLA to avoid repeated training-graph compilation.
 
 ## CUDA Training Example
 

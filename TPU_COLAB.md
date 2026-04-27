@@ -265,18 +265,26 @@ bash train.sh
 - a local `./val` directory. If only `./val` exists, the script uses it for both
   training and validation as a pipeline smoke test.
 
-The script defaults to `model-kind=b12c192`, `batch-size=64`,
-`max-training-samples=65536`, `warmup-samples=8192`, warmup+cosine LR, and
-validation capped to 16 batches. Validation metrics are accumulated on-device
-and copied to the host once per print window or validation pass. The default
-`PRINT_EVERY=20` also avoids forcing TPU metric transfers every step. Override
-settings with environment variables:
+The script defaults to `model-kind=b12c192`, `batch-size=256`,
+`max-training-samples=262144`, `warmup-samples=32768`, warmup+cosine LR, and
+validation capped to 16 batches. AdamW uses capturable step tensors on XLA to
+avoid per-step optimizer host reads. Validation metrics are accumulated
+on-device and copied to the host once per print window or validation pass. The
+default `PRINT_EVERY=20` also avoids forcing TPU metric transfers every step.
+Override settings with environment variables:
 
 ```bash
 BATCH_SIZE=128 MAX_TRAINING_SAMPLES=131072 WARMUP_SAMPLES=16384 bash train.sh
 ```
 
-If Colab runs out of HBM, retry with `BATCH_SIZE=32`.
+If Colab runs out of HBM, retry with `BATCH_SIZE=128`.
+
+If capturable AdamW causes an optimizer compatibility error with a specific
+Colab wheel, rerun with:
+
+```bash
+TRAINDIR=./tpu_real_run_b256_nocap bash train.sh --disable-xla-capturable-adamw
+```
 
 This run intentionally switches back to warmup+cosine. Watch `xla_compile`
 after the first few print windows; if it becomes nonzero every window again,
@@ -301,17 +309,17 @@ python -u train.py \
   --traindir ./tpu_real_run \
   --datadir /path/to/shuffleddata \
   --pos-len 19 \
-  --batch-size 64 \
+  --batch-size 256 \
   --model-kind b12c192 \
   --lr 2e-4 \
   --lr-schedule cosine \
-  --max-training-samples 65536 \
+  --max-training-samples 262144 \
   --symmetry-type xyt \
   --print-every 20 \
-  --save-every-samples 16384 \
-  --val-every-samples 16384 \
+  --save-every-samples 65536 \
+  --val-every-samples 65536 \
   --max-val-batches 16 \
-  --warmup-samples 8192 \
+  --warmup-samples 32768 \
   --prefetch-batches 0 \
   --no-compile \
   --no-tensorboard \

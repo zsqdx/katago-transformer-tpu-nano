@@ -684,7 +684,17 @@ def main(rank, world_size, args, gpu_id):
         ]
         if adam_params:
             adam_param_groups.append({"params": list(adam_params.values()), "weight_decay": base_wd})
-        inner_optimizer = torch.optim.AdamW(adam_param_groups, lr=base_lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
+        xla_capturable_adamw = device.type == "xla" and not args.disable_xla_capturable_adamw
+        if xla_capturable_adamw:
+            logging.info("XLA AdamW capturable mode enabled")
+        inner_optimizer = torch.optim.AdamW(
+            adam_param_groups,
+            lr=base_lr,
+            betas=(0.9, 0.95),
+            fused=(device.type == "cuda"),
+            foreach=False if xla_capturable_adamw else None,
+            capturable=xla_capturable_adamw,
+        )
         muon_opt = MuonOptimizer(
             muon_params, lr_multiplier=0.2,
             momentum=0.95, wd=base_wd, device=device, use_te=bool(args.use_te),
@@ -1510,6 +1520,8 @@ if __name__ == "__main__":
                         help="Enable per-stage CUDA-synced profiling (adds sync overhead)")
     parser.add_argument("--xla-peak-tflops", type=float, default=918.0,
                         help="BF16 peak TFLOPS per XLA device for MFU reporting (v6e=918)")
+    parser.add_argument("--disable-xla-capturable-adamw", action="store_true",
+                        help="Disable capturable AdamW on XLA if a torch_xla wheel has optimizer compatibility issues")
     parser.add_argument("--no-tensorboard", action="store_true",
                         help="Disable TensorBoard logging")
     parser.add_argument("--ema-decay", type=float, default=0.0,

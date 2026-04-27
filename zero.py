@@ -243,7 +243,12 @@ class ZeROAdamW:
             param_groups.append({"params": [], "weight_decay": 0.0})
 
         self._optimizer = torch.optim.AdamW(
-            param_groups, lr=lr, betas=betas, fused=(device.type == "cuda"),
+            param_groups,
+            lr=lr,
+            betas=betas,
+            fused=(device.type == "cuda"),
+            foreach=False if device.type == "xla" else None,
+            capturable=(device.type == "xla"),
         )
 
         # Log partition info
