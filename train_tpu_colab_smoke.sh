@@ -58,5 +58,6 @@ python -u train.py \
     --print-every 1 \
     --prefetch-batches 0 \
     --no-compile \
+    --no-tensorboard \
     --amp-dtype bf16 \
     --seed 1234

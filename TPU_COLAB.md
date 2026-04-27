@@ -88,6 +88,7 @@ python -u train.py \
   --warmup-samples 256 \
   --prefetch-batches 0 \
   --no-compile \
+  --no-tensorboard \
   --amp-dtype bf16
 ```
 

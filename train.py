@@ -746,14 +746,16 @@ def main(rank, world_size, args, gpu_id):
 
     # TensorBoard (rank 0 only)
     tb_writer = None
-    if rank == 0:
+    if rank == 0 and not args.no_tensorboard:
         try:
             from torch.utils.tensorboard import SummaryWriter
             tb_dir = os.path.join(args.traindir, "tb_logs")
             tb_writer = SummaryWriter(log_dir=tb_dir)
             logging.info(f"TensorBoard: {tb_dir}")
-        except ImportError:
-            logging.info("TensorBoard not available")
+        except Exception as e:
+            logging.warning(f"TensorBoard disabled: {type(e).__name__}: {e}")
+    elif rank == 0:
+        logging.info("TensorBoard disabled by --no-tensorboard")
 
     # Save checkpoint (all ranks must call when ZeRO is active — gather is collective)
     _async_save_thread = None
@@ -1343,6 +1345,8 @@ if __name__ == "__main__":
                         help="AMP dtype: bf16 (default), fp16 (with loss scaling), none (disable AMP)")
     parser.add_argument("--profile", action="store_true",
                         help="Enable per-stage CUDA-synced profiling (adds sync overhead)")
+    parser.add_argument("--no-tensorboard", action="store_true",
+                        help="Disable TensorBoard logging")
     parser.add_argument("--ema-decay", type=float, default=0.0,
                         help="EMA decay rate for model params (0=disabled, typical: 0.999 or 0.9999)")
     parser.add_argument("--varlen", action="store_true",
