@@ -18,6 +18,11 @@ python -m pip uninstall -y torch_xla torch torchvision torchaudio libtpu || true
 
 python -m pip install --upgrade pip
 
+# Colab Python 3.12 may keep an old apt-provided pkg_resources on sys.path.
+# tpu-info/protobuf imports can fail with pkgutil.ImpImporter unless setuptools
+# is upgraded in the active Python environment.
+python -m pip install --upgrade "setuptools>=70" wheel
+
 # Use the official PyTorch CPU wheel index. TPU/XLA does not need the large
 # CUDA-enabled PyPI torch wheel, and Colab downloads are prone to timeouts.
 python -m pip install --retries "${PIP_RETRIES}" --timeout "${PIP_TIMEOUT}" --force-reinstall \

@@ -50,14 +50,18 @@ Colab/libtpu runtime exposes them.
 
 ```python
 import pathlib
+import sys
 import subprocess
 import time
 from IPython.display import clear_output
 
 LOG = pathlib.Path("/content/katago-transformer-tpu-nano/tpu_real_run/train0.log")
+TPU_INFO_READY = None
+TPU_INFO_ERROR = ""
+TPU_INFO_REPAIRED = False
 
 def run(cmd, timeout=10):
-    out = subprocess.run(
+    return subprocess.run(
         cmd,
         text=True,
         stdout=subprocess.PIPE,
@@ -65,7 +69,59 @@ def run(cmd, timeout=10):
         timeout=timeout,
         check=False,
     )
-    return out.stdout
+
+def short_error(text, max_lines=12):
+    if "pkgutil.ImpImporter" in text or "pkg_resources" in text:
+        return (
+            "tpu-info failed because Colab is using an old pkg_resources "
+            "package that is incompatible with Python 3.12.\n"
+            "This cell tried to repair it with:\n"
+            "  python -m pip install -U 'setuptools>=70' wheel\n"
+            "If the error remains, run that command once in a separate cell "
+            "and restart the runtime."
+        )
+    lines = [line for line in text.splitlines() if line.strip()]
+    return "\n".join(lines[-max_lines:]) if lines else "(no output)"
+
+def ensure_tpu_info():
+    global TPU_INFO_READY, TPU_INFO_ERROR, TPU_INFO_REPAIRED
+    if TPU_INFO_READY is True:
+        return True
+
+    try:
+        probe = run(["tpu-info", "--version"])
+    except Exception as exc:
+        TPU_INFO_READY = False
+        TPU_INFO_ERROR = f"tpu-info failed: {exc}"
+        return False
+    if probe.returncode == 0:
+        TPU_INFO_READY = True
+        TPU_INFO_ERROR = ""
+        return True
+
+    output = probe.stdout
+    needs_setuptools = "pkgutil.ImpImporter" in output or "pkg_resources" in output
+    if needs_setuptools and not TPU_INFO_REPAIRED:
+        TPU_INFO_REPAIRED = True
+        try:
+            repair = run(
+                [sys.executable, "-m", "pip", "install", "-q", "--upgrade", "setuptools>=70", "wheel"],
+                timeout=120,
+            )
+            probe = run(["tpu-info", "--version"])
+        except Exception as exc:
+            TPU_INFO_READY = False
+            TPU_INFO_ERROR = f"tpu-info repair failed: {exc}"
+            return False
+        if probe.returncode == 0:
+            TPU_INFO_READY = True
+            TPU_INFO_ERROR = ""
+            return True
+        output = repair.stdout + "\n" + probe.stdout
+
+    TPU_INFO_READY = False
+    TPU_INFO_ERROR = short_error(output)
+    return False
 
 while True:
     clear_output(wait=True)
@@ -76,8 +132,13 @@ while True:
     else:
         print(f"{LOG} not found yet")
 
-    try:
-        list_metrics = run(["tpu-info", "--list_metrics"])
+    if ensure_tpu_info():
+        try:
+            metrics_proc = run(["tpu-info", "--list_metrics"])
+            list_metrics = metrics_proc.stdout if metrics_proc.returncode == 0 else ""
+        except Exception as exc:
+            list_metrics = ""
+
         requested = [
             name for name in (
                 "duty_cycle_percent",
@@ -90,20 +151,22 @@ while True:
             )
             if name in list_metrics
         ]
-    except Exception:
-        requested = []
 
-    commands = []
-    if requested:
-        commands.append(["tpu-info", "--metric", *requested])
-    commands.extend((["tpu-info"], ["tpu-info", "--process"]))
+        commands = []
+        if requested:
+            commands.append(["tpu-info", "--metric", *requested])
+        commands.extend((["tpu-info"], ["tpu-info", "--process"]))
 
-    for cmd in commands:
-        print("\n=== " + " ".join(cmd) + " ===")
-        try:
-            print(run(cmd))
-        except Exception as exc:
-            print(f"{' '.join(cmd)} failed: {exc}")
+        for cmd in commands:
+            print("\n=== " + " ".join(cmd) + " ===")
+            try:
+                out = run(cmd)
+                print(out.stdout if out.returncode == 0 else short_error(out.stdout))
+            except Exception as exc:
+                print(f"{' '.join(cmd)} failed: {exc}")
+    else:
+        print("\n=== tpu-info ===")
+        print(TPU_INFO_ERROR)
 
     time.sleep(5)
 ```
@@ -111,6 +174,13 @@ while True:
 Training logs also report TPU MFU. For XLA runs, the normal `MFU` is wall-clock
 MFU including compile/data overhead, while `xla_mfu` is based on XLA
 `ExecuteTime` and is closer to device execution MFU.
+
+If `tpu-info` still reports `pkgutil.ImpImporter` after the cell's automatic
+repair attempt, run this once and restart the Colab runtime:
+
+```bash
+python -m pip install -U "setuptools>=70" wheel
+```
 
 ## Fixing `_XLAC` Import Errors
 
