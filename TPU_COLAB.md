@@ -201,6 +201,10 @@ Training logs also report TPU MFU. For XLA runs, the normal `MFU` is wall-clock
 MFU including compile/data overhead, while `xla_mfu` is based on XLA
 `ExecuteTime` and is closer to device execution MFU.
 
+The training loop uses `xm.mark_step()` for the per-step XLA barrier. If
+`xla_d2h` remains high in the logs, look for explicit host reads such as
+`.item()`, `.tolist()`, or `.cpu()` in the active training path.
+
 If `tpu-info` still reports `pkgutil.ImpImporter` after the cell's automatic
 repair attempt, run this once and restart the Colab runtime:
 
