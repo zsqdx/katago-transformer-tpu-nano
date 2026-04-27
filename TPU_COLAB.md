@@ -268,10 +268,12 @@ bash train.sh
 The script defaults to `model-kind=b12c192`, `batch-size=256`,
 `max-training-samples=262144`, `warmup-samples=32768`, warmup+cosine LR, and
 validation capped to 16 batches. AdamW uses capturable step tensors on XLA to
-avoid per-step optimizer host reads. Validation metrics are accumulated
-on-device and copied to the host once per print window or validation pass. The
-default `PRINT_EVERY=20` also avoids forcing TPU metric transfers every step.
-Override settings with environment variables:
+avoid per-step optimizer host reads, and CPU batches are sent to XLA with a
+batched transfer path when the installed `torch_xla` wheel supports it.
+Validation metrics are accumulated on-device and copied to the host once per
+print window or validation pass. The default `PRINT_EVERY=20` also avoids
+forcing TPU metric transfers every step. Override settings with environment
+variables:
 
 ```bash
 BATCH_SIZE=128 MAX_TRAINING_SAMPLES=131072 WARMUP_SAMPLES=16384 bash train.sh
@@ -279,11 +281,32 @@ BATCH_SIZE=128 MAX_TRAINING_SAMPLES=131072 WARMUP_SAMPLES=16384 bash train.sh
 
 If Colab runs out of HBM, retry with `BATCH_SIZE=128`.
 
+To reduce optimizer/clip overhead per sample without increasing activation
+memory, try gradient accumulation:
+
+```bash
+GRAD_ACCUM_STEPS=2 TRAINDIR=./tpu_real_run_b256_acc2 bash train.sh
+```
+
+For a short performance-only check, you can also temporarily disable gradient
+clipping:
+
+```bash
+GRAD_CLIP_NORM=0 TRAINDIR=./tpu_real_run_b256_noclip bash train.sh
+```
+
 If capturable AdamW causes an optimizer compatibility error with a specific
 Colab wheel, rerun with:
 
 ```bash
 TRAINDIR=./tpu_real_run_b256_nocap bash train.sh --disable-xla-capturable-adamw
+```
+
+If the batched XLA transfer path falls back or regresses on a specific wheel,
+rerun with:
+
+```bash
+TRAINDIR=./tpu_real_run_b256_notransferbatch bash train.sh --disable-xla-batched-transfer
 ```
 
 This run intentionally switches back to warmup+cosine. Watch `xla_compile`
@@ -310,8 +333,10 @@ python -u train.py \
   --datadir /path/to/shuffleddata \
   --pos-len 19 \
   --batch-size 256 \
+  --grad-accum-steps 1 \
   --model-kind b12c192 \
   --lr 2e-4 \
+  --grad-clip-norm 1.0 \
   --lr-schedule cosine \
   --max-training-samples 262144 \
   --symmetry-type xyt \

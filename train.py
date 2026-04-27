@@ -306,6 +306,11 @@ def main(rank, world_size, args, gpu_id):
     if device.type == "xla" and args.prefetch_batches > 0:
         logging.warning("Disabling threaded prefetch on XLA for the initial TPU path")
         args.prefetch_batches = 0
+    if device.type == "xla":
+        if args.disable_xla_batched_transfer:
+            logging.info("XLA batched CPU data transfer disabled")
+        else:
+            logging.info("XLA batched CPU data transfer enabled")
 
     def sync_xla_if_needed():
         if torch_xla_mod is None:
@@ -929,6 +934,8 @@ def main(rank, world_size, args, gpu_id):
     running_metrics_t = torch.zeros(len(_metric_keys), device=device) if use_xla_tensor_metrics else None
     # count, grad_norm, muon_update_rms, shampoo_precond_rms
     running_extra_t = torch.zeros(4, device=device) if use_xla_tensor_metrics else None
+    xla_metric_one_t = torch.ones((), device=device) if use_xla_tensor_metrics else None
+    xla_metric_zero_t = torch.zeros((), device=device) if use_xla_tensor_metrics else None
 
     def reset_running():
         for k in running:
@@ -1081,6 +1088,7 @@ def main(rank, world_size, args, gpu_id):
             seed=args.seed + rank if args.seed is not None else None,
             varlen=args.varlen,
             allow_nonfull_mask=args.allow_nonfull_mask,
+            xla_batched_transfer=not args.disable_xla_batched_transfer,
         )
         profiler.tick()
         for batch in data_processing.prefetch_generator(train_gen, args.prefetch_batches):
@@ -1236,26 +1244,29 @@ def main(rank, world_size, args, gpu_id):
                     grad_scaler.update(found_inf=True)
                 else:
                     # Gradient clipping + optimizer step
-                    if dp_zero:
-                        # Distributed clip: each rank only has its partition's gradients.
-                        owned_params = [
-                            p for opt in [zero_adam, muon_opt, shampoo_opt]
-                            if opt is not None
-                            for p in opt.partitions[rank].values()
-                            if p.grad is not None
-                        ]
-                        local_norm_sq = sum((p.grad.norm() ** 2 for p in owned_params),
-                                            torch.tensor(0.0, device=device))
-                        global_norm_sq = local_norm_sq.unsqueeze(0)
-                        torch.distributed.all_reduce(global_norm_sq)
-                        grad_norm = global_norm_sq.sqrt()
-                        clip_coef = torch.clamp(1.0 / (grad_norm + 1e-6), max=1.0)
-                        for p in owned_params:
-                            p.grad.mul_(clip_coef)
-                        if not use_xla_tensor_metrics:
-                            grad_norm = grad_norm.item()
+                    if args.grad_clip_norm > 0:
+                        if dp_zero:
+                            # Distributed clip: each rank only has its partition's gradients.
+                            owned_params = [
+                                p for opt in [zero_adam, muon_opt, shampoo_opt]
+                                if opt is not None
+                                for p in opt.partitions[rank].values()
+                                if p.grad is not None
+                            ]
+                            local_norm_sq = sum((p.grad.norm() ** 2 for p in owned_params),
+                                                torch.tensor(0.0, device=device))
+                            global_norm_sq = local_norm_sq.unsqueeze(0)
+                            torch.distributed.all_reduce(global_norm_sq)
+                            grad_norm = global_norm_sq.sqrt()
+                            clip_coef = torch.clamp(args.grad_clip_norm / (grad_norm + 1e-6), max=1.0)
+                            for p in owned_params:
+                                p.grad.mul_(clip_coef)
+                            if not use_xla_tensor_metrics:
+                                grad_norm = grad_norm.item()
+                        else:
+                            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_norm)
                     else:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        grad_norm = torch.zeros((), device=device) if use_xla_tensor_metrics else 0.0
                     profiler.tick("clip")
                     if zero_adam is not None:
                         # Defer ZeRO param sync and do one coalesced sync after all optimizers step.
@@ -1300,10 +1311,10 @@ def main(rank, world_size, args, gpu_id):
                     else:
                         grad_norm_t = torch.tensor(float(grad_norm), device=device)
                     running_extra_t = running_extra_t + torch.stack([
-                        torch.ones((), device=device),
+                        xla_metric_one_t,
                         grad_norm_t,
-                        torch.tensor(float(muon_opt.last_update_rms if muon_opt is not None else 0.0), device=device),
-                        torch.tensor(float(shampoo_opt.last_precond_rms if shampoo_opt is not None else 0.0), device=device),
+                        torch.tensor(float(muon_opt.last_update_rms), device=device) if muon_opt is not None else xla_metric_zero_t,
+                        torch.tensor(float(shampoo_opt.last_precond_rms), device=device) if shampoo_opt is not None else xla_metric_zero_t,
                     ])
                 else:
                     for k in _metric_keys:
@@ -1380,6 +1391,7 @@ def main(rank, world_size, args, gpu_id):
                                 use_pin_memory=use_pin_memory,
                                 varlen=args.varlen,
                                 allow_nonfull_mask=args.allow_nonfull_mask,
+                                xla_batched_transfer=not args.disable_xla_batched_transfer,
                             )
                             for val_batch_idx, val_batch in enumerate(data_processing.prefetch_generator(val_gen, args.prefetch_batches)):
                                 if args.max_val_batches > 0 and val_batch_idx >= args.max_val_batches:
@@ -1474,6 +1486,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-heads", type=int, default=6, help="Number of attention heads")
     parser.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate (cosine schedule)")
     parser.add_argument("--wd", type=float, default=0.1, help="Weight decay (cosine schedule)")
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0,
+                        help="Global gradient clipping norm; set <=0 to disable clipping")
     parser.add_argument("--lr-schedule", type=str, default="cosine", choices=["cosine", "hzy", "constant"],
                         help="LR schedule: cosine, hzy (step-function from lr_schedule.xlsx), or constant")
     parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "muon", "shampoo"],
@@ -1522,6 +1536,8 @@ if __name__ == "__main__":
                         help="BF16 peak TFLOPS per XLA device for MFU reporting (v6e=918)")
     parser.add_argument("--disable-xla-capturable-adamw", action="store_true",
                         help="Disable capturable AdamW on XLA if a torch_xla wheel has optimizer compatibility issues")
+    parser.add_argument("--disable-xla-batched-transfer", action="store_true",
+                        help="Disable batched CPU-to-XLA batch transfer and use per-tensor .to(device) copies")
     parser.add_argument("--no-tensorboard", action="store_true",
                         help="Disable TensorBoard logging")
     parser.add_argument("--ema-decay", type=float, default=0.0,

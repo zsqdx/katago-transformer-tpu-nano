@@ -77,8 +77,11 @@ no separate `train/` directory is present. It now defaults to a moderate TPU
 run: batch size 256, 262,144 training samples, 32,768 warmup samples, cosine
 LR, and validation capped to 16 batches. Validation metrics are accumulated on
 the device and copied back once per print window or validation pass. On TPU,
-AdamW uses capturable step tensors, and random symmetries/history preprocessing
-are applied before transfer to XLA to avoid repeated training-graph compilation.
+AdamW uses capturable step tensors, CPU batches are transferred to XLA in one
+batched call when available, and random symmetries/history preprocessing are
+applied before transfer to XLA to avoid repeated training-graph compilation.
+For throughput experiments, `train.sh` also exposes `GRAD_ACCUM_STEPS` and
+`GRAD_CLIP_NORM` environment overrides.
 
 ## CUDA Training Example
 

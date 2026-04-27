@@ -13,6 +13,10 @@ import torch.nn.functional
 
 import configs
 
+_XLA_SEND_CPU_DATA_TO_DEVICE = None
+_XLA_SEND_LOOKED_UP = False
+_XLA_SEND_FAILED = False
+
 
 def prefetch_generator(gen, prefetch_batches):
     """Prefetch batches in a background thread to overlap data prep with GPU compute."""
@@ -46,6 +50,38 @@ def prefetch_generator(gen, prefetch_batches):
     t.join()
 
 
+def _float_cpu_tensor(array):
+    tensor = torch.from_numpy(array)
+    if tensor.dtype != torch.float32:
+        tensor = tensor.float()
+    return tensor
+
+
+def _get_xla_cpu_sender():
+    global _XLA_SEND_CPU_DATA_TO_DEVICE, _XLA_SEND_LOOKED_UP
+    if not _XLA_SEND_LOOKED_UP:
+        _XLA_SEND_LOOKED_UP = True
+        try:
+            import torch_xla.core.xla_model as xm
+            _XLA_SEND_CPU_DATA_TO_DEVICE = getattr(xm, "send_cpu_data_to_device", None)
+        except Exception:
+            _XLA_SEND_CPU_DATA_TO_DEVICE = None
+    return _XLA_SEND_CPU_DATA_TO_DEVICE
+
+
+def _send_cpu_batch_to_xla(batch, device):
+    global _XLA_SEND_FAILED
+    sender = None if _XLA_SEND_FAILED else _get_xla_cpu_sender()
+    if sender is not None:
+        try:
+            return sender(batch, device)
+        except Exception as exc:
+            if not _XLA_SEND_FAILED:
+                logging.warning("XLA batched CPU transfer failed, falling back to per-tensor .to(device): %s", exc)
+            _XLA_SEND_FAILED = True
+    return {k: v.to(device) for k, v in batch.items()}
+
+
 def read_npz_training_data(
     npz_files,
     batch_size: int,
@@ -61,6 +97,7 @@ def read_npz_training_data(
     seed=None,
     varlen: bool = False,
     allow_nonfull_mask: bool = False,
+    xla_batched_transfer: bool = True,
 ):
     if seed is not None:
         rand = np.random.default_rng(seed=seed)
@@ -213,6 +250,22 @@ def read_npz_training_data(
                         batch_metadataInputNC_np = np.ascontiguousarray(batch_metadataInputNC_np)
                     if include_qvalues:
                         batch_qValueTargetsNCMove_np = np.ascontiguousarray(batch_qValueTargetsNCMove_np)
+
+                if prepare_on_host and xla_batched_transfer:
+                    batch = dict(
+                        binaryInputNCHW=_float_cpu_tensor(batch_binaryInputNCHW_np),
+                        globalInputNC=_float_cpu_tensor(batch_globalInputNC_np),
+                        policyTargetsNCMove=_float_cpu_tensor(batch_policyTargetsNCMove_np),
+                        globalTargetsNC=_float_cpu_tensor(batch_globalTargetsNC_np),
+                        scoreDistrN=_float_cpu_tensor(batch_scoreDistrN_np),
+                        valueTargetsNCHW=_float_cpu_tensor(batch_valueTargetsNCHW_np),
+                    )
+                    if include_meta:
+                        batch["metadataInputNC"] = _float_cpu_tensor(batch_metadataInputNC_np)
+                    if include_qvalues:
+                        batch["qValueTargetsNCMove"] = _float_cpu_tensor(batch_qValueTargetsNCMove_np)
+                    yield _send_cpu_batch_to_xla(batch, device)
+                    continue
 
                 if use_pin_memory:
                     batch_binaryInputNCHW = torch.from_numpy(batch_binaryInputNCHW_np).pin_memory().to(device, non_blocking=True).float()

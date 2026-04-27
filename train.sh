@@ -43,8 +43,10 @@ python -u train.py \
     --datadir "${DATA_ROOT}" \
     --pos-len "${POS_LEN:-19}" \
     --batch-size "${BATCH_SIZE:-256}" \
+    --grad-accum-steps "${GRAD_ACCUM_STEPS:-1}" \
     --model-kind "${MODEL_KIND:-b12c192}" \
     --lr "${LR:-2e-4}" \
+    --grad-clip-norm "${GRAD_CLIP_NORM:-1.0}" \
     --lr-schedule "${LR_SCHEDULE:-cosine}" \
     --max-training-samples "${MAX_TRAINING_SAMPLES:-262144}" \
     --symmetry-type "${SYMMETRY_TYPE:-xyt}" \
