@@ -230,7 +230,7 @@ bash train.sh
   training and validation as a pipeline smoke test.
 
 The script defaults to `model-kind=b12c192`, `batch-size=16`,
-`max-training-samples=1024`, constant LR, and validation capped to 16 batches.
+`max-training-samples=1024`, constant LR, and validation capped to 4 batches.
 Constant LR avoids recompiling the XLA optimizer graph every step during short
 smoke tests. Validation metrics are accumulated on-device and copied to the
 host once per print window or validation pass. The default `PRINT_EVERY=10`
@@ -265,7 +265,7 @@ python -u train.py \
   --print-every 10 \
   --save-every-samples 1024 \
   --val-every-samples 1024 \
-  --max-val-batches 16 \
+  --max-val-batches 4 \
   --warmup-samples 256 \
   --prefetch-batches 0 \
   --no-compile \

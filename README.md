@@ -74,7 +74,7 @@ bash train.sh
 
 `train.sh` uses `val/` as both `train/` and `val/` for a pipeline smoke test if
 no separate `train/` directory is present. It defaults to constant LR and caps
-validation to 16 batches so TPU smoke tests do not spend minutes validating a
+validation to 4 batches so TPU smoke tests do not spend minutes validating a
 large file. Validation metrics are accumulated on the device and copied back
 once per print window or validation pass.
 

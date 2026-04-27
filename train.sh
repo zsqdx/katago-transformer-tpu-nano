@@ -51,7 +51,7 @@ python -u train.py \
     --print-every "${PRINT_EVERY:-10}" \
     --save-every-samples "${SAVE_EVERY_SAMPLES:-1024}" \
     --val-every-samples "${VAL_EVERY_SAMPLES:-1024}" \
-    --max-val-batches "${MAX_VAL_BATCHES:-16}" \
+    --max-val-batches "${MAX_VAL_BATCHES:-4}" \
     --warmup-samples "${WARMUP_SAMPLES:-256}" \
     --prefetch-batches 0 \
     --no-compile \
