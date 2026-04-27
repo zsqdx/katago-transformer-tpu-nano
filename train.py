@@ -529,6 +529,18 @@ def main(rank, world_size, args, gpu_id):
         total_samples_trained = 0
 
     model.to(device)
+    moving_sum_state_t = torch.tensor(float(model.moving_unowned_proportion_sum), device=device)
+    moving_weight_state_t = torch.tensor(float(model.moving_unowned_proportion_weight), device=device)
+
+    def sync_moving_state_to_model():
+        if device.type != "xla":
+            return
+        vals = torch.stack([
+            moving_sum_state_t.detach(),
+            moving_weight_state_t.detach(),
+        ]).cpu().tolist()
+        model.moving_unowned_proportion_sum = float(vals[0])
+        model.moving_unowned_proportion_weight = float(vals[1])
 
     # EMA (shadow copy of params on same device, before compile/DDP)
     ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0 else None
@@ -821,6 +833,7 @@ def main(rank, world_size, args, gpu_id):
 
         # Only rank 0 assembles state_dict and writes the file
         if rank == 0:
+            sync_moving_state_to_model()
             sync_xla_if_needed()
             # Deep-copy model weights to CPU (training continues modifying GPU tensors)
             model_state_cpu = {k: v.cpu() for k, v in model.state_dict().items()}
@@ -902,10 +915,33 @@ def main(rank, world_size, args, gpu_id):
     running["grad_norm"] = 0.0
     running["muon_update_rms"] = 0.0
     running["shampoo_precond_rms"] = 0.0
+    use_xla_tensor_metrics = device.type == "xla"
+    running_metrics_t = torch.zeros(len(_metric_keys), device=device) if use_xla_tensor_metrics else None
+    # count, grad_norm, muon_update_rms, shampoo_precond_rms
+    running_extra_t = torch.zeros(4, device=device) if use_xla_tensor_metrics else None
 
     def reset_running():
         for k in running:
             running[k] = 0.0
+        if use_xla_tensor_metrics:
+            running_metrics_t.zero_()
+            running_extra_t.zero_()
+
+    def load_running_from_tensors():
+        if not use_xla_tensor_metrics:
+            return
+        vals_t = torch.cat([running_metrics_t, running_extra_t])
+        if world_size > 1:
+            torch.distributed.all_reduce(vals_t, op=torch.distributed.ReduceOp.SUM)
+            vals_t /= world_size
+        vals = vals_t.detach().cpu().tolist()
+        for i, k in enumerate(_metric_keys):
+            running[k] = vals[i]
+        offset = len(_metric_keys)
+        running["count"] = vals[offset]
+        running["grad_norm"] = vals[offset + 1]
+        running["muon_update_rms"] = vals[offset + 2]
+        running["shampoo_precond_rms"] = vals[offset + 3]
 
     _per_sample_keys = [k for k in _metric_keys if k not in ("loss", "wsum")]
 
@@ -985,8 +1021,11 @@ def main(rank, world_size, args, gpu_id):
     last_print_time = time.perf_counter()
     accum_step = 0
     micro_metrics_accum = {k: 0.0 for k in _metric_keys}
+    micro_metrics_accum_t = torch.zeros(len(_metric_keys), device=device) if use_xla_tensor_metrics else None
     accum_moving_sum = 0.0
     accum_moving_weight = 0.0
+    accum_moving_sum_t = torch.zeros((), device=device) if use_xla_tensor_metrics else None
+    accum_moving_weight_t = torch.zeros((), device=device) if use_xla_tensor_metrics else None
     _last_spatial = None
     _last_global = None
 
@@ -999,8 +1038,13 @@ def main(rank, world_size, args, gpu_id):
             accum_step = 0
             for k in _metric_keys:
                 micro_metrics_accum[k] = 0.0
+            if use_xla_tensor_metrics:
+                micro_metrics_accum_t.zero_()
             accum_moving_sum = 0.0
             accum_moving_weight = 0.0
+            if use_xla_tensor_metrics:
+                accum_moving_sum_t.zero_()
+                accum_moving_weight_t.zero_()
 
         # Find training files
         train_files = sorted(glob.glob(os.path.join(train_dir, "*.npz")))
@@ -1055,8 +1099,12 @@ def main(rank, world_size, args, gpu_id):
                 profiler.tick("fwd")
 
                 # Compiled postprocess + loss (seki moving average computed inside as tensor ops)
-                moving_sum_t = torch.tensor(model.moving_unowned_proportion_sum, device=device)
-                moving_weight_t = torch.tensor(model.moving_unowned_proportion_weight, device=device)
+                if use_xla_tensor_metrics:
+                    moving_sum_t = moving_sum_state_t
+                    moving_weight_t = moving_weight_state_t
+                else:
+                    moving_sum_t = torch.tensor(model.moving_unowned_proportion_sum, device=device)
+                    moving_weight_t = torch.tensor(model.moving_unowned_proportion_weight, device=device)
                 train_mask = batch["binaryInputNCHW"][:, 0:1, :, :].contiguous() if args.varlen else None
                 loss, metrics_stack, new_moving_sum, new_moving_weight = compiled_loss_fn(
                     outputs, model.value_head.score_belief_offset_vector,
@@ -1082,30 +1130,49 @@ def main(rank, world_size, args, gpu_id):
                 scaled_loss.backward()
             profiler.tick("bwd")
 
-            # Accumulate micro-step metrics and seki moving average
-            metrics = dict(zip(_METRIC_KEYS, metrics_stack.tolist()))
-            for k in metrics:
-                micro_metrics_accum[k] += metrics[k]
-            accum_moving_sum += new_moving_sum.item()
-            accum_moving_weight += new_moving_weight.item()
+            # Accumulate micro-step metrics and seki moving average. On XLA,
+            # keep these on-device to avoid per-step host sync and recompiles.
+            if use_xla_tensor_metrics:
+                micro_metrics_accum_t = micro_metrics_accum_t + metrics_stack.detach()
+                accum_moving_sum_t = accum_moving_sum_t + new_moving_sum.detach()
+                accum_moving_weight_t = accum_moving_weight_t + new_moving_weight.detach()
+            else:
+                metrics = dict(zip(_METRIC_KEYS, metrics_stack.tolist()))
+                for k in metrics:
+                    micro_metrics_accum[k] += metrics[k]
+                accum_moving_sum += new_moving_sum.item()
+                accum_moving_weight += new_moving_weight.item()
 
             accum_step += 1
 
             if accum_step == grad_accum_steps:
                 accum_step = 0
 
-                # Write back seki moving average (averaged across micro-steps and ranks)
-                avg_moving_sum = accum_moving_sum / grad_accum_steps
-                avg_moving_weight = accum_moving_weight / grad_accum_steps
-                if world_size > 1:
-                    mv_t = torch.tensor([avg_moving_sum, avg_moving_weight], device=device)
-                    torch.distributed.all_reduce(mv_t, op=torch.distributed.ReduceOp.SUM)
-                    mv_t /= world_size
-                    avg_moving_sum, avg_moving_weight = mv_t.tolist()
-                model.moving_unowned_proportion_sum = avg_moving_sum
-                model.moving_unowned_proportion_weight = avg_moving_weight
-                accum_moving_sum = 0.0
-                accum_moving_weight = 0.0
+                # Write back seki moving average (averaged across micro-steps and ranks).
+                if use_xla_tensor_metrics:
+                    mv_t = torch.stack([
+                        accum_moving_sum_t / grad_accum_steps,
+                        accum_moving_weight_t / grad_accum_steps,
+                    ])
+                    if world_size > 1:
+                        torch.distributed.all_reduce(mv_t, op=torch.distributed.ReduceOp.SUM)
+                        mv_t /= world_size
+                    moving_sum_state_t = mv_t[0].detach()
+                    moving_weight_state_t = mv_t[1].detach()
+                    accum_moving_sum_t = torch.zeros_like(accum_moving_sum_t)
+                    accum_moving_weight_t = torch.zeros_like(accum_moving_weight_t)
+                else:
+                    avg_moving_sum = accum_moving_sum / grad_accum_steps
+                    avg_moving_weight = accum_moving_weight / grad_accum_steps
+                    if world_size > 1:
+                        mv_t = torch.tensor([avg_moving_sum, avg_moving_weight], device=device)
+                        torch.distributed.all_reduce(mv_t, op=torch.distributed.ReduceOp.SUM)
+                        mv_t /= world_size
+                        avg_moving_sum, avg_moving_weight = mv_t.tolist()
+                    model.moving_unowned_proportion_sum = avg_moving_sum
+                    model.moving_unowned_proportion_weight = avg_moving_weight
+                    accum_moving_sum = 0.0
+                    accum_moving_weight = 0.0
 
                 # In zero dp-mode, reduce gradients to owner ranks before clipping.
                 if grad_reducer is not None:
@@ -1173,10 +1240,10 @@ def main(rank, world_size, args, gpu_id):
                         torch.distributed.all_reduce(global_norm_sq)
                         grad_norm = global_norm_sq.sqrt()
                         clip_coef = torch.clamp(1.0 / (grad_norm + 1e-6), max=1.0)
-                        if clip_coef < 1.0:
-                            for p in owned_params:
-                                p.grad.mul_(clip_coef)
-                        grad_norm = grad_norm.item()
+                        for p in owned_params:
+                            p.grad.mul_(clip_coef)
+                        if not use_xla_tensor_metrics:
+                            grad_norm = grad_norm.item()
                     else:
                         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     profiler.tick("clip")
@@ -1214,20 +1281,36 @@ def main(rank, world_size, args, gpu_id):
                 global_step += 1
                 total_samples_trained += batch_size * world_size * grad_accum_steps
 
-                # Average micro-step metrics and add to running totals
-                for k in _metric_keys:
-                    running[k] += micro_metrics_accum[k] / grad_accum_steps
-                    micro_metrics_accum[k] = 0.0
-                running["grad_norm"] += grad_norm if isinstance(grad_norm, float) else grad_norm.item()
-                if muon_opt is not None:
-                    running["muon_update_rms"] += muon_opt.last_update_rms
-                if shampoo_opt is not None:
-                    running["shampoo_precond_rms"] += shampoo_opt.last_precond_rms
-                running["count"] += 1
+                # Average micro-step metrics and add to running totals.
+                if use_xla_tensor_metrics:
+                    running_metrics_t = running_metrics_t + micro_metrics_accum_t / grad_accum_steps
+                    micro_metrics_accum_t = torch.zeros_like(micro_metrics_accum_t)
+                    if torch.is_tensor(grad_norm):
+                        grad_norm_t = grad_norm.detach()
+                    else:
+                        grad_norm_t = torch.tensor(float(grad_norm), device=device)
+                    running_extra_t = running_extra_t + torch.stack([
+                        torch.ones((), device=device),
+                        grad_norm_t,
+                        torch.tensor(float(muon_opt.last_update_rms if muon_opt is not None else 0.0), device=device),
+                        torch.tensor(float(shampoo_opt.last_precond_rms if shampoo_opt is not None else 0.0), device=device),
+                    ])
+                else:
+                    for k in _metric_keys:
+                        running[k] += micro_metrics_accum[k] / grad_accum_steps
+                        micro_metrics_accum[k] = 0.0
+                    running["grad_norm"] += grad_norm if isinstance(grad_norm, float) else grad_norm.item()
+                    if muon_opt is not None:
+                        running["muon_update_rms"] += muon_opt.last_update_rms
+                    if shampoo_opt is not None:
+                        running["shampoo_precond_rms"] += shampoo_opt.last_precond_rms
+                    running["count"] += 1
 
                 if global_step % args.print_every == 0:
                     # All-reduce running metrics across ranks
-                    if world_size > 1:
+                    if use_xla_tensor_metrics:
+                        load_running_from_tensors()
+                    elif world_size > 1:
                         keys = list(running.keys())
                         vals = torch.tensor([running[k] for k in keys], device=device)
                         torch.distributed.all_reduce(vals, op=torch.distributed.ReduceOp.SUM)
@@ -1267,8 +1350,12 @@ def main(rank, world_size, args, gpu_id):
                         val_metrics_t = None
                         val_count_t = torch.zeros((), device=device)
                         with torch.no_grad():
-                            moving_sum_t = torch.tensor(model.moving_unowned_proportion_sum, device=device)
-                            moving_weight_t = torch.tensor(model.moving_unowned_proportion_weight, device=device)
+                            if use_xla_tensor_metrics:
+                                moving_sum_t = moving_sum_state_t
+                                moving_weight_t = moving_weight_state_t
+                            else:
+                                moving_sum_t = torch.tensor(model.moving_unowned_proportion_sum, device=device)
+                                moving_weight_t = torch.tensor(model.moving_unowned_proportion_weight, device=device)
                             val_gen = data_processing.read_npz_training_data(
                                 val_files[:3],
                                 batch_size=batch_size,

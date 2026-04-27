@@ -76,7 +76,7 @@ bash train.sh
 no separate `train/` directory is present. It defaults to constant LR and caps
 validation to 16 batches so TPU smoke tests do not spend minutes validating a
 large file. Validation metrics are accumulated on the device and copied back
-once per validation pass.
+once per print window or validation pass.
 
 ## CUDA Training Example
 

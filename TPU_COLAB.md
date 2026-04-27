@@ -233,7 +233,9 @@ The script defaults to `model-kind=b12c192`, `batch-size=16`,
 `max-training-samples=1024`, constant LR, and validation capped to 16 batches.
 Constant LR avoids recompiling the XLA optimizer graph every step during short
 smoke tests. Validation metrics are accumulated on-device and copied to the
-host once per validation pass. Override settings with environment variables:
+host once per print window or validation pass. The default `PRINT_EVERY=10`
+also avoids forcing TPU metric transfers every step. Override settings with
+environment variables:
 
 ```bash
 BATCH_SIZE=32 MAX_TRAINING_SAMPLES=4096 bash train.sh
@@ -260,7 +262,7 @@ python -u train.py \
   --lr-schedule constant \
   --max-training-samples 1024 \
   --symmetry-type xyt \
-  --print-every 1 \
+  --print-every 10 \
   --save-every-samples 1024 \
   --val-every-samples 1024 \
   --max-val-batches 16 \

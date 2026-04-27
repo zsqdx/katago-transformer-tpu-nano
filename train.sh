@@ -48,7 +48,7 @@ python -u train.py \
     --lr-schedule "${LR_SCHEDULE:-constant}" \
     --max-training-samples "${MAX_TRAINING_SAMPLES:-1024}" \
     --symmetry-type "${SYMMETRY_TYPE:-xyt}" \
-    --print-every "${PRINT_EVERY:-1}" \
+    --print-every "${PRINT_EVERY:-10}" \
     --save-every-samples "${SAVE_EVERY_SAMPLES:-1024}" \
     --val-every-samples "${VAL_EVERY_SAMPLES:-1024}" \
     --max-val-batches "${MAX_VAL_BATCHES:-16}" \
