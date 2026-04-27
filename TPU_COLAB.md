@@ -303,6 +303,37 @@ TRAINDIR=./tpu_real_run_b512 \
 bash train.sh
 ```
 
+The batch-512 `b12c192` run is still too narrow to improve utilization much.
+The next useful sweep is widening the trunk. Start conservatively, then raise
+`BATCH_SIZE` if HBM allows it:
+
+```bash
+MODEL_KIND=b12c512 \
+BATCH_SIZE=128 \
+MAX_TRAINING_SAMPLES=131072 \
+WARMUP_SAMPLES=16384 \
+TRAINDIR=./tpu_real_run_b12c512_b128 \
+bash train.sh
+
+MODEL_KIND=b12c768 \
+BATCH_SIZE=64 \
+MAX_TRAINING_SAMPLES=131072 \
+WARMUP_SAMPLES=16384 \
+TRAINDIR=./tpu_real_run_b12c768_b64 \
+bash train.sh
+
+MODEL_KIND=b12c1024 \
+BATCH_SIZE=32 \
+MAX_TRAINING_SAMPLES=65536 \
+WARMUP_SAMPLES=8192 \
+TRAINDIR=./tpu_real_run_b12c1024_b32 \
+bash train.sh
+```
+
+For each width, compare only stable windows after `xla_compile=0.0s/0`. If the
+run fits comfortably, try doubling the batch once. If it runs out of HBM, halve
+the batch.
+
 To reduce optimizer/clip overhead per sample without increasing activation
 memory, try gradient accumulation:
 
