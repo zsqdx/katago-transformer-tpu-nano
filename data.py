@@ -68,8 +68,14 @@ def read_npz_training_data(
         rand = np.random.default_rng(seed=list(os.urandom(12)))
     num_bin_features = configs.get_num_bin_input_features(model_config)
     num_global_features = configs.get_num_global_input_features(model_config)
+    prepare_on_host = device.type == "xla"
     if enable_history_matrices:
-        (h_base, h_builder) = build_history_matrices(model_config, device)
+        if prepare_on_host:
+            h_base, h_builder = None, None
+            (h_base_np, h_builder_np) = build_history_matrices_np(model_config)
+        else:
+            (h_base, h_builder) = build_history_matrices(model_config, device)
+            h_base_np, h_builder_np = None, None
 
     include_qvalues = model_config["version"] >= 16 and model_config["version"] < 100
 
@@ -148,81 +154,128 @@ def read_npz_training_data(
                 start = (n * world_size + rank) * read_batch_size
                 end = start + read_batch_size
 
-                if use_pin_memory:
-                    batch_binaryInputNCHW = torch.from_numpy(binaryInputNCHW[start:end]).pin_memory().to(device, non_blocking=True).float()
-                    batch_globalInputNC = torch.from_numpy(globalInputNC[start:end]).pin_memory().to(device, non_blocking=True).float()
-                    batch_policyTargetsNCMove = torch.from_numpy(policyTargetsNCMove[start:end]).pin_memory().to(device, non_blocking=True).float()
-                    batch_globalTargetsNC = torch.from_numpy(globalTargetsNC[start:end]).pin_memory().to(device, non_blocking=True).float()
-                    batch_scoreDistrN = torch.from_numpy(scoreDistrN[start:end]).pin_memory().to(device, non_blocking=True).float()
-                    batch_valueTargetsNCHW = torch.from_numpy(valueTargetsNCHW[start:end]).pin_memory().to(device, non_blocking=True).float()
-                    if include_meta:
-                        batch_metadataInputNC = torch.from_numpy(metadataInputNC[start:end]).pin_memory().to(device, non_blocking=True).float()
-                    if include_qvalues:
-                        batch_qValueTargetsNCMove = torch.from_numpy(qValueTargetsNCMove[start:end]).pin_memory().to(device, non_blocking=True).float()
-                else:
-                    batch_binaryInputNCHW = torch.from_numpy(binaryInputNCHW[start:end]).to(device).float()
-                    batch_globalInputNC = torch.from_numpy(globalInputNC[start:end]).to(device).float()
-                    batch_policyTargetsNCMove = torch.from_numpy(policyTargetsNCMove[start:end]).to(device).float()
-                    batch_globalTargetsNC = torch.from_numpy(globalTargetsNC[start:end]).to(device).float()
-                    batch_scoreDistrN = torch.from_numpy(scoreDistrN[start:end]).to(device).float()
-                    batch_valueTargetsNCHW = torch.from_numpy(valueTargetsNCHW[start:end]).to(device).float()
-                    if include_meta:
-                        batch_metadataInputNC = torch.from_numpy(metadataInputNC[start:end]).to(device).float()
-                    if include_qvalues:
-                        batch_qValueTargetsNCMove = torch.from_numpy(qValueTargetsNCMove[start:end]).to(device).float()
+                batch_binaryInputNCHW_np = binaryInputNCHW[start:end]
+                batch_globalInputNC_np = globalInputNC[start:end]
+                batch_policyTargetsNCMove_np = policyTargetsNCMove[start:end]
+                batch_globalTargetsNC_np = globalTargetsNC[start:end]
+                batch_scoreDistrN_np = scoreDistrN[start:end]
+                batch_valueTargetsNCHW_np = valueTargetsNCHW[start:end]
+                if include_meta:
+                    batch_metadataInputNC_np = metadataInputNC[start:end]
+                if include_qvalues:
+                    batch_qValueTargetsNCMove_np = qValueTargetsNCMove[start:end]
 
-                if enable_history_matrices:
-                    (batch_binaryInputNCHW, batch_globalInputNC) = apply_history_matrices(
-                        model_config, batch_binaryInputNCHW, batch_globalInputNC, batch_globalTargetsNC, h_base, h_builder
-                    )
+                if prepare_on_host:
+                    if enable_history_matrices:
+                        (batch_binaryInputNCHW_np, batch_globalInputNC_np) = apply_history_matrices_np(
+                            model_config, batch_binaryInputNCHW_np, batch_globalInputNC_np,
+                            batch_globalTargetsNC_np, h_base_np, h_builder_np, rand,
+                        )
 
-                if symmetry_type is not None and symmetry_type != "" and symmetry_type != "none":
-                    if is_symmetry_all:
-                        # Apply all 8 symmetries to each sample, expanding read_batch_size -> batch_size
-                        sym_binary_parts = []
-                        sym_policy_parts = []
-                        sym_value_parts = []
-                        if include_qvalues:
-                            sym_qvalue_parts = []
-                        for symm in range(8):
-                            sym_binary_parts.append(apply_symmetry(batch_binaryInputNCHW, symm))
-                            sym_policy_parts.append(apply_symmetry_policy(batch_policyTargetsNCMove, symm, pos_len))
-                            sym_value_parts.append(apply_symmetry(batch_valueTargetsNCHW, symm))
+                    if symmetry_type is not None and symmetry_type != "" and symmetry_type != "none":
+                        if is_symmetry_all:
+                            sym_binary_parts = []
+                            sym_policy_parts = []
+                            sym_value_parts = []
                             if include_qvalues:
-                                sym_qvalue_parts.append(apply_symmetry_policy(batch_qValueTargetsNCMove, symm, pos_len))
-                        batch_binaryInputNCHW = torch.cat(sym_binary_parts, dim=0)
-                        batch_policyTargetsNCMove = torch.cat(sym_policy_parts, dim=0)
-                        batch_valueTargetsNCHW = torch.cat(sym_value_parts, dim=0)
-                        if include_qvalues:
-                            batch_qValueTargetsNCMove = torch.cat(sym_qvalue_parts, dim=0)
-                        # Non-spatial tensors: repeat 8 times to match
-                        batch_globalInputNC = batch_globalInputNC.repeat(8, 1)
-                        batch_globalTargetsNC = batch_globalTargetsNC.repeat(8, 1)
-                        batch_scoreDistrN = batch_scoreDistrN.repeat(8, 1)
-                        if include_meta:
-                            batch_metadataInputNC = batch_metadataInputNC.repeat(8, 1)
-                    else:
-                        allowed_symms = []
-                        if symmetry_type == "xyt":
-                            allowed_symms = [0, 1, 2, 3, 4, 5, 6, 7]
-                        elif symmetry_type == "x":
-                            allowed_symms = [0, 5]
-                        elif symmetry_type == "xy":
-                            allowed_symms = [0, 2, 5, 7]
-                        elif symmetry_type == "x+y":
-                            allowed_symms = [0, 2]
-                        elif symmetry_type == "t":
-                            allowed_symms = [0, 4]
+                                sym_qvalue_parts = []
+                            for symm in range(8):
+                                sym_binary_parts.append(apply_symmetry_np(batch_binaryInputNCHW_np, symm))
+                                sym_policy_parts.append(apply_symmetry_policy_np(batch_policyTargetsNCMove_np, symm, pos_len))
+                                sym_value_parts.append(apply_symmetry_np(batch_valueTargetsNCHW_np, symm))
+                                if include_qvalues:
+                                    sym_qvalue_parts.append(apply_symmetry_policy_np(batch_qValueTargetsNCMove_np, symm, pos_len))
+                            batch_binaryInputNCHW_np = np.concatenate(sym_binary_parts, axis=0)
+                            batch_policyTargetsNCMove_np = np.concatenate(sym_policy_parts, axis=0)
+                            batch_valueTargetsNCHW_np = np.concatenate(sym_value_parts, axis=0)
+                            if include_qvalues:
+                                batch_qValueTargetsNCMove_np = np.concatenate(sym_qvalue_parts, axis=0)
+                            batch_globalInputNC_np = np.tile(batch_globalInputNC_np, (8, 1))
+                            batch_globalTargetsNC_np = np.tile(batch_globalTargetsNC_np, (8, 1))
+                            batch_scoreDistrN_np = np.tile(batch_scoreDistrN_np, (8, 1))
+                            if include_meta:
+                                batch_metadataInputNC_np = np.tile(batch_metadataInputNC_np, (8, 1))
                         else:
-                            assert False, f"Unknown data symmetry type {symmetry_type}"
+                            symm = sample_symmetry(symmetry_type, rand)
+                            batch_binaryInputNCHW_np = apply_symmetry_np(batch_binaryInputNCHW_np, symm)
+                            batch_policyTargetsNCMove_np = apply_symmetry_policy_np(batch_policyTargetsNCMove_np, symm, pos_len)
+                            batch_valueTargetsNCHW_np = apply_symmetry_np(batch_valueTargetsNCHW_np, symm)
+                            if include_qvalues:
+                                batch_qValueTargetsNCMove_np = apply_symmetry_policy_np(batch_qValueTargetsNCMove_np, symm, pos_len)
 
-                        symm = allowed_symms[int(rand.integers(0, len(allowed_symms)))]
+                    batch_binaryInputNCHW_np = np.ascontiguousarray(batch_binaryInputNCHW_np)
+                    batch_globalInputNC_np = np.ascontiguousarray(batch_globalInputNC_np)
+                    batch_policyTargetsNCMove_np = np.ascontiguousarray(batch_policyTargetsNCMove_np)
+                    batch_globalTargetsNC_np = np.ascontiguousarray(batch_globalTargetsNC_np)
+                    batch_scoreDistrN_np = np.ascontiguousarray(batch_scoreDistrN_np)
+                    batch_valueTargetsNCHW_np = np.ascontiguousarray(batch_valueTargetsNCHW_np)
+                    if include_meta:
+                        batch_metadataInputNC_np = np.ascontiguousarray(batch_metadataInputNC_np)
+                    if include_qvalues:
+                        batch_qValueTargetsNCMove_np = np.ascontiguousarray(batch_qValueTargetsNCMove_np)
 
-                        batch_binaryInputNCHW = apply_symmetry(batch_binaryInputNCHW, symm)
-                        batch_policyTargetsNCMove = apply_symmetry_policy(batch_policyTargetsNCMove, symm, pos_len)
-                        batch_valueTargetsNCHW = apply_symmetry(batch_valueTargetsNCHW, symm)
-                        if include_qvalues:
-                            batch_qValueTargetsNCMove = apply_symmetry_policy(batch_qValueTargetsNCMove, symm, pos_len)
+                if use_pin_memory:
+                    batch_binaryInputNCHW = torch.from_numpy(batch_binaryInputNCHW_np).pin_memory().to(device, non_blocking=True).float()
+                    batch_globalInputNC = torch.from_numpy(batch_globalInputNC_np).pin_memory().to(device, non_blocking=True).float()
+                    batch_policyTargetsNCMove = torch.from_numpy(batch_policyTargetsNCMove_np).pin_memory().to(device, non_blocking=True).float()
+                    batch_globalTargetsNC = torch.from_numpy(batch_globalTargetsNC_np).pin_memory().to(device, non_blocking=True).float()
+                    batch_scoreDistrN = torch.from_numpy(batch_scoreDistrN_np).pin_memory().to(device, non_blocking=True).float()
+                    batch_valueTargetsNCHW = torch.from_numpy(batch_valueTargetsNCHW_np).pin_memory().to(device, non_blocking=True).float()
+                    if include_meta:
+                        batch_metadataInputNC = torch.from_numpy(batch_metadataInputNC_np).pin_memory().to(device, non_blocking=True).float()
+                    if include_qvalues:
+                        batch_qValueTargetsNCMove = torch.from_numpy(batch_qValueTargetsNCMove_np).pin_memory().to(device, non_blocking=True).float()
+                else:
+                    batch_binaryInputNCHW = torch.from_numpy(batch_binaryInputNCHW_np).to(device).float()
+                    batch_globalInputNC = torch.from_numpy(batch_globalInputNC_np).to(device).float()
+                    batch_policyTargetsNCMove = torch.from_numpy(batch_policyTargetsNCMove_np).to(device).float()
+                    batch_globalTargetsNC = torch.from_numpy(batch_globalTargetsNC_np).to(device).float()
+                    batch_scoreDistrN = torch.from_numpy(batch_scoreDistrN_np).to(device).float()
+                    batch_valueTargetsNCHW = torch.from_numpy(batch_valueTargetsNCHW_np).to(device).float()
+                    if include_meta:
+                        batch_metadataInputNC = torch.from_numpy(batch_metadataInputNC_np).to(device).float()
+                    if include_qvalues:
+                        batch_qValueTargetsNCMove = torch.from_numpy(batch_qValueTargetsNCMove_np).to(device).float()
+
+                if not prepare_on_host:
+                    if enable_history_matrices:
+                        (batch_binaryInputNCHW, batch_globalInputNC) = apply_history_matrices(
+                            model_config, batch_binaryInputNCHW, batch_globalInputNC, batch_globalTargetsNC, h_base, h_builder
+                        )
+
+                    if symmetry_type is not None and symmetry_type != "" and symmetry_type != "none":
+                        if is_symmetry_all:
+                            # Apply all 8 symmetries to each sample, expanding read_batch_size -> batch_size
+                            sym_binary_parts = []
+                            sym_policy_parts = []
+                            sym_value_parts = []
+                            if include_qvalues:
+                                sym_qvalue_parts = []
+                            for symm in range(8):
+                                sym_binary_parts.append(apply_symmetry(batch_binaryInputNCHW, symm))
+                                sym_policy_parts.append(apply_symmetry_policy(batch_policyTargetsNCMove, symm, pos_len))
+                                sym_value_parts.append(apply_symmetry(batch_valueTargetsNCHW, symm))
+                                if include_qvalues:
+                                    sym_qvalue_parts.append(apply_symmetry_policy(batch_qValueTargetsNCMove, symm, pos_len))
+                            batch_binaryInputNCHW = torch.cat(sym_binary_parts, dim=0)
+                            batch_policyTargetsNCMove = torch.cat(sym_policy_parts, dim=0)
+                            batch_valueTargetsNCHW = torch.cat(sym_value_parts, dim=0)
+                            if include_qvalues:
+                                batch_qValueTargetsNCMove = torch.cat(sym_qvalue_parts, dim=0)
+                            # Non-spatial tensors: repeat 8 times to match
+                            batch_globalInputNC = batch_globalInputNC.repeat(8, 1)
+                            batch_globalTargetsNC = batch_globalTargetsNC.repeat(8, 1)
+                            batch_scoreDistrN = batch_scoreDistrN.repeat(8, 1)
+                            if include_meta:
+                                batch_metadataInputNC = batch_metadataInputNC.repeat(8, 1)
+                        else:
+                            symm = sample_symmetry(symmetry_type, rand)
+
+                            batch_binaryInputNCHW = apply_symmetry(batch_binaryInputNCHW, symm)
+                            batch_policyTargetsNCMove = apply_symmetry_policy(batch_policyTargetsNCMove, symm, pos_len)
+                            batch_valueTargetsNCHW = apply_symmetry(batch_valueTargetsNCHW, symm)
+                            if include_qvalues:
+                                batch_qValueTargetsNCMove = apply_symmetry_policy(batch_qValueTargetsNCMove, symm, pos_len)
 
                 batch_binaryInputNCHW = batch_binaryInputNCHW.contiguous()
                 batch_policyTargetsNCMove = batch_policyTargetsNCMove.contiguous()
@@ -258,6 +311,22 @@ def apply_symmetry_policy(tensor, symm, pos_len):
     ), dim=2)
 
 
+def sample_symmetry(symmetry_type, rand):
+    if symmetry_type == "xyt":
+        allowed_symms = [0, 1, 2, 3, 4, 5, 6, 7]
+    elif symmetry_type == "x":
+        allowed_symms = [0, 5]
+    elif symmetry_type == "xy":
+        allowed_symms = [0, 2, 5, 7]
+    elif symmetry_type == "x+y":
+        allowed_symms = [0, 2]
+    elif symmetry_type == "t":
+        allowed_symms = [0, 4]
+    else:
+        assert False, f"Unknown data symmetry type {symmetry_type}"
+    return allowed_symms[int(rand.integers(0, len(allowed_symms)))]
+
+
 def apply_symmetry(tensor, symm):
     """
     Apply a symmetry operation to the given tensor.
@@ -286,6 +355,41 @@ def apply_symmetry(tensor, symm):
         return tensor.transpose(-2, -1).flip(-1).flip(-2)
     if symm == 7:
         return tensor.flip(-2)
+
+
+def apply_symmetry_policy_np(array, symm, pos_len):
+    """Numpy version used for XLA host-side data augmentation."""
+    batch_size = array.shape[0]
+    channels = array.shape[1]
+    array_without_pass = array[:, :, :-1].reshape((batch_size, channels, pos_len, pos_len))
+    array_transformed = apply_symmetry_np(array_without_pass, symm)
+    return np.concatenate((
+        array_transformed.reshape(batch_size, channels, pos_len * pos_len),
+        array[:, :, -1:],
+    ), axis=2)
+
+
+def apply_symmetry_np(array, symm):
+    """Numpy version of apply_symmetry. Returns a view when possible."""
+    assert array.shape[-1] == array.shape[-2]
+
+    if symm == 0:
+        return array
+    if symm == 1:
+        return np.flip(np.swapaxes(array, -2, -1), axis=-2)
+    if symm == 2:
+        return np.flip(np.flip(array, axis=-1), axis=-2)
+    if symm == 3:
+        return np.flip(np.swapaxes(array, -2, -1), axis=-1)
+    if symm == 4:
+        return np.swapaxes(array, -2, -1)
+    if symm == 5:
+        return np.flip(array, axis=-1)
+    if symm == 6:
+        return np.flip(np.flip(np.swapaxes(array, -2, -1), axis=-1), axis=-2)
+    if symm == 7:
+        return np.flip(array, axis=-2)
+    assert False, f"Unknown symmetry {symm}"
 
 
 def build_history_matrices(model_config: configs.ModelConfig, device):
@@ -352,6 +456,47 @@ def build_history_matrices(model_config: configs.ModelConfig, device):
     return (h_base, h_builder)
 
 
+def build_history_matrices_np(model_config: configs.ModelConfig):
+    num_bin_features = configs.get_num_bin_input_features(model_config)
+    assert num_bin_features == 22, "Currently this code is hardcoded for this many features"
+
+    h_base = np.diag(np.array(
+        [
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+            0.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        ],
+        dtype=np.float32,
+    ))
+    h_base[14, 15] = 1.0
+    h_base[14, 16] = 1.0
+
+    h0 = np.zeros((num_bin_features, num_bin_features), dtype=np.float32)
+    h0[9, 9] = 1.0
+    h0[14, 15] = -1.0
+    h0[14, 16] = -1.0
+    h0[15, 15] = 1.0
+    h0[15, 16] = 1.0
+
+    h1 = np.zeros((num_bin_features, num_bin_features), dtype=np.float32)
+    h1[10, 10] = 1.0
+    h1[15, 16] = -1.0
+    h1[16, 16] = 1.0
+
+    h2 = np.zeros((num_bin_features, num_bin_features), dtype=np.float32)
+    h2[11, 11] = 1.0
+
+    h3 = np.zeros((num_bin_features, num_bin_features), dtype=np.float32)
+    h3[12, 12] = 1.0
+
+    h4 = np.zeros((num_bin_features, num_bin_features), dtype=np.float32)
+    h4[13, 13] = 1.0
+
+    h_base = h_base.reshape((1, num_bin_features, num_bin_features))
+    h_builder = np.stack((h0, h1, h2, h3, h4), axis=0)
+    return (h_base, h_builder)
+
+
 def apply_history_matrices(model_config, batch_binaryInputNCHW, batch_globalInputNC, batch_globalTargetsNC, h_base, h_builder):
     num_global_features = configs.get_num_global_input_features(model_config)
     # Generate random on CPU to avoid conflict with torch.compile CUDA graph capture
@@ -366,4 +511,27 @@ def apply_history_matrices(model_config, batch_binaryInputNCHW, batch_globalInpu
     batch_globalInputNC = batch_globalInputNC * torch.nn.functional.pad(
         include_history, ((0, num_global_features - include_history.shape[1])), value=1.0
     )
+    return batch_binaryInputNCHW, batch_globalInputNC
+
+
+def apply_history_matrices_np(
+    model_config,
+    batch_binaryInputNCHW,
+    batch_globalInputNC,
+    batch_globalTargetsNC,
+    h_base,
+    h_builder,
+    rand,
+):
+    num_global_features = configs.get_num_global_input_features(model_config)
+    ref = batch_globalTargetsNC[:, 36:41]
+    should_stop_history = (rand.random(ref.shape) >= 0.98)
+    include_history = (np.cumsum(should_stop_history, axis=1, dtype=np.float32) <= 0.1).astype(np.float32)
+
+    h_matrix = h_base + np.einsum("bi,ijk->bjk", include_history, h_builder)
+    batch_binaryInputNCHW = np.einsum("bijk,bil->bljk", batch_binaryInputNCHW, h_matrix).astype(np.float32, copy=False)
+
+    pad_width = num_global_features - include_history.shape[1]
+    include_padded = np.pad(include_history, ((0, 0), (0, pad_width)), mode="constant", constant_values=1.0)
+    batch_globalInputNC = batch_globalInputNC * include_padded
     return batch_binaryInputNCHW, batch_globalInputNC

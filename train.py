@@ -308,12 +308,12 @@ def main(rank, world_size, args, gpu_id):
         args.prefetch_batches = 0
 
     def sync_xla_if_needed():
-        if xm is None:
+        if torch_xla_mod is None:
             return
-        # Use mark_step as the per-iteration XLA barrier. torch_xla.sync()
-        # is stronger and can materialize live tensors on the host, which shows
-        # up as repeated TransferFromDevice work in the XLA metrics.
-        xm.mark_step()
+        if hasattr(torch_xla_mod, "sync"):
+            torch_xla_mod.sync()
+        else:
+            xm.mark_step()
 
     # Step profiler
     profiler = StepProfiler(device) if args.profile else _NullProfiler()
