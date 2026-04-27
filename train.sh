@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# TPU v6e-1 real-data smoke training.
+# TPU v6e-1 real-data training.
 #
 # Expected data layout for train.py:
 #   DATADIR/
@@ -42,17 +42,17 @@ python -u train.py \
     --traindir "${TRAINDIR:-./tpu_real_run}" \
     --datadir "${DATA_ROOT}" \
     --pos-len "${POS_LEN:-19}" \
-    --batch-size "${BATCH_SIZE:-16}" \
+    --batch-size "${BATCH_SIZE:-64}" \
     --model-kind "${MODEL_KIND:-b12c192}" \
     --lr "${LR:-2e-4}" \
-    --lr-schedule "${LR_SCHEDULE:-constant}" \
-    --max-training-samples "${MAX_TRAINING_SAMPLES:-1024}" \
+    --lr-schedule "${LR_SCHEDULE:-cosine}" \
+    --max-training-samples "${MAX_TRAINING_SAMPLES:-65536}" \
     --symmetry-type "${SYMMETRY_TYPE:-xyt}" \
-    --print-every "${PRINT_EVERY:-10}" \
-    --save-every-samples "${SAVE_EVERY_SAMPLES:-1024}" \
-    --val-every-samples "${VAL_EVERY_SAMPLES:-1024}" \
-    --max-val-batches "${MAX_VAL_BATCHES:-4}" \
-    --warmup-samples "${WARMUP_SAMPLES:-256}" \
+    --print-every "${PRINT_EVERY:-20}" \
+    --save-every-samples "${SAVE_EVERY_SAMPLES:-16384}" \
+    --val-every-samples "${VAL_EVERY_SAMPLES:-16384}" \
+    --max-val-batches "${MAX_VAL_BATCHES:-16}" \
+    --warmup-samples "${WARMUP_SAMPLES:-8192}" \
     --prefetch-batches 0 \
     --no-compile \
     --no-tensorboard \

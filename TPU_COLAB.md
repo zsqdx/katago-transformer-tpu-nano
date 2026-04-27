@@ -251,7 +251,8 @@ PIP_RETRIES=20 PIP_TIMEOUT=2000 bash colab_install_torch_xla.sh
 
 ## Real Data Test
 
-After the smoke test passes, run the real loader with conservative settings:
+After the smoke test passes, run the real loader with a moderate TPU v6e-1
+training configuration:
 
 ```bash
 export PJRT_DEVICE=TPU
@@ -264,16 +265,25 @@ bash train.sh
 - a local `./val` directory. If only `./val` exists, the script uses it for both
   training and validation as a pipeline smoke test.
 
-The script defaults to `model-kind=b12c192`, `batch-size=16`,
-`max-training-samples=1024`, constant LR, and validation capped to 4 batches.
-Constant LR avoids recompiling the XLA optimizer graph every step during short
-smoke tests. Validation metrics are accumulated on-device and copied to the
-host once per print window or validation pass. The default `PRINT_EVERY=10`
-also avoids forcing TPU metric transfers every step. Override settings with
-environment variables:
+The script defaults to `model-kind=b12c192`, `batch-size=64`,
+`max-training-samples=65536`, `warmup-samples=8192`, warmup+cosine LR, and
+validation capped to 16 batches. Validation metrics are accumulated on-device
+and copied to the host once per print window or validation pass. The default
+`PRINT_EVERY=20` also avoids forcing TPU metric transfers every step. Override
+settings with environment variables:
 
 ```bash
-BATCH_SIZE=32 MAX_TRAINING_SAMPLES=4096 bash train.sh
+BATCH_SIZE=128 MAX_TRAINING_SAMPLES=131072 WARMUP_SAMPLES=16384 bash train.sh
+```
+
+If Colab runs out of HBM, retry with `BATCH_SIZE=32`.
+
+This run intentionally switches back to warmup+cosine. Watch `xla_compile`
+after the first few print windows; if it becomes nonzero every window again,
+isolate LR scheduling with:
+
+```bash
+LR_SCHEDULE=constant bash train.sh
 ```
 
 For a full validation pass on all validation rows:
@@ -291,17 +301,17 @@ python -u train.py \
   --traindir ./tpu_real_run \
   --datadir /path/to/shuffleddata \
   --pos-len 19 \
-  --batch-size 16 \
+  --batch-size 64 \
   --model-kind b12c192 \
   --lr 2e-4 \
-  --lr-schedule constant \
-  --max-training-samples 1024 \
+  --lr-schedule cosine \
+  --max-training-samples 65536 \
   --symmetry-type xyt \
-  --print-every 10 \
-  --save-every-samples 1024 \
-  --val-every-samples 1024 \
-  --max-val-batches 4 \
-  --warmup-samples 256 \
+  --print-every 20 \
+  --save-every-samples 16384 \
+  --val-every-samples 16384 \
+  --max-val-batches 16 \
+  --warmup-samples 8192 \
   --prefetch-batches 0 \
   --no-compile \
   --no-tensorboard \
