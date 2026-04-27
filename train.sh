@@ -37,6 +37,11 @@ if [ "${ENABLE_HISTORY_MATRICES:-1}" != "0" ]; then
     EXTRA_FLAGS+=(--enable-history-matrices)
 fi
 
+MAX_TRAINING_SAMPLES_VALUE="${MAX_TRAINING_SAMPLES:-262144}"
+SAVE_EVERY_SAMPLES_VALUE="${SAVE_EVERY_SAMPLES:-${MAX_TRAINING_SAMPLES_VALUE}}"
+VAL_EVERY_SAMPLES_VALUE="${VAL_EVERY_SAMPLES:-${MAX_TRAINING_SAMPLES_VALUE}}"
+WARMUP_SAMPLES_VALUE="${WARMUP_SAMPLES:-32768}"
+
 python -u train.py \
     --device xla \
     --traindir "${TRAINDIR:-./tpu_real_run}" \
@@ -48,13 +53,13 @@ python -u train.py \
     --lr "${LR:-2e-4}" \
     --grad-clip-norm "${GRAD_CLIP_NORM:-1.0}" \
     --lr-schedule "${LR_SCHEDULE:-cosine}" \
-    --max-training-samples "${MAX_TRAINING_SAMPLES:-262144}" \
+    --max-training-samples "${MAX_TRAINING_SAMPLES_VALUE}" \
     --symmetry-type "${SYMMETRY_TYPE:-xyt}" \
     --print-every "${PRINT_EVERY:-20}" \
-    --save-every-samples "${SAVE_EVERY_SAMPLES:-65536}" \
-    --val-every-samples "${VAL_EVERY_SAMPLES:-65536}" \
+    --save-every-samples "${SAVE_EVERY_SAMPLES_VALUE}" \
+    --val-every-samples "${VAL_EVERY_SAMPLES_VALUE}" \
     --max-val-batches "${MAX_VAL_BATCHES:-16}" \
-    --warmup-samples "${WARMUP_SAMPLES:-32768}" \
+    --warmup-samples "${WARMUP_SAMPLES_VALUE}" \
     --prefetch-batches 0 \
     --no-compile \
     --no-tensorboard \

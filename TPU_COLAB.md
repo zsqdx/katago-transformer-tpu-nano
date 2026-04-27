@@ -267,19 +267,41 @@ bash train.sh
 
 The script defaults to `model-kind=b12c192`, `batch-size=256`,
 `max-training-samples=262144`, `warmup-samples=32768`, warmup+cosine LR, and
-validation capped to 16 batches. AdamW uses capturable step tensors on XLA to
-avoid per-step optimizer host reads, and CPU batches are sent to XLA with a
-batched transfer path when the installed `torch_xla` wheel supports it.
-Validation metrics are accumulated on-device and copied to the host once per
-print window or validation pass. The default `PRINT_EVERY=20` also avoids
-forcing TPU metric transfers every step. Override settings with environment
-variables:
+validation capped to 16 batches. By default, save and validation run at the end
+of the default training window, because Colab TPU checkpoint/validation
+interruptions are much slower than the steady training loop. AdamW uses
+capturable step tensors on XLA to avoid per-step optimizer host reads, and CPU
+batches are sent to XLA with a batched transfer path when the installed
+`torch_xla` wheel supports it. Validation metrics are accumulated on-device and
+copied to the host once per print window or validation pass. The default
+`PRINT_EVERY=20` also avoids forcing TPU metric transfers every step. Override
+settings with environment variables:
 
 ```bash
 BATCH_SIZE=128 MAX_TRAINING_SAMPLES=131072 WARMUP_SAMPLES=16384 bash train.sh
 ```
 
 If Colab runs out of HBM, retry with `BATCH_SIZE=128`.
+
+For frequent checkpoints/validation while debugging:
+
+```bash
+SAVE_EVERY_SAMPLES=65536 VAL_EVERY_SAMPLES=65536 bash train.sh
+```
+
+The `GRAD_ACCUM_STEPS=2` probe keeps the per-microbatch size at 256, so it does
+not improve TPU matrix utilization. If HBM allows it, test a true larger
+microbatch next:
+
+```bash
+BATCH_SIZE=512 \
+MAX_TRAINING_SAMPLES=524288 \
+WARMUP_SAMPLES=65536 \
+SAVE_EVERY_SAMPLES=524288 \
+VAL_EVERY_SAMPLES=524288 \
+TRAINDIR=./tpu_real_run_b512 \
+bash train.sh
+```
 
 To reduce optimizer/clip overhead per sample without increasing activation
 memory, try gradient accumulation:
@@ -341,8 +363,8 @@ python -u train.py \
   --max-training-samples 262144 \
   --symmetry-type xyt \
   --print-every 20 \
-  --save-every-samples 65536 \
-  --val-every-samples 65536 \
+  --save-every-samples 262144 \
+  --val-every-samples 262144 \
   --max-val-batches 16 \
   --warmup-samples 32768 \
   --prefetch-batches 0 \
