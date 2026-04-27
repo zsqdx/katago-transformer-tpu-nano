@@ -45,16 +45,19 @@ python -u train.py \
     --batch-size "${BATCH_SIZE:-16}" \
     --model-kind "${MODEL_KIND:-b12c192}" \
     --lr "${LR:-2e-4}" \
+    --lr-schedule "${LR_SCHEDULE:-constant}" \
     --max-training-samples "${MAX_TRAINING_SAMPLES:-1024}" \
     --symmetry-type "${SYMMETRY_TYPE:-xyt}" \
     --print-every "${PRINT_EVERY:-1}" \
     --save-every-samples "${SAVE_EVERY_SAMPLES:-1024}" \
     --val-every-samples "${VAL_EVERY_SAMPLES:-1024}" \
+    --max-val-batches "${MAX_VAL_BATCHES:-16}" \
     --warmup-samples "${WARMUP_SAMPLES:-256}" \
     --prefetch-batches 0 \
     --no-compile \
     --no-tensorboard \
     --allow-nonfull-mask \
+    --xla-peak-tflops "${XLA_PEAK_TFLOPS:-918}" \
     --amp-dtype "${AMP_DTYPE:-bf16}" \
     --seed "${SEED:-1234}" \
     "${EXTRA_FLAGS[@]}" \

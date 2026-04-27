@@ -29,7 +29,7 @@ import configs
 import data as data_processing
 from optimizers import MuonOptimizer, ShampooOptimizer
 from zero import ZeROAdamW, ZeROMuon, ZeROShampoo, sync_zero_params, reduce_zero_grads, ZeROGradReducer
-from losses import compute_loss, postprocess_and_loss_core, _METRIC_KEYS, estimate_forward_flops, get_gpu_peak_tflops
+from losses import postprocess_and_loss_core, _METRIC_KEYS, estimate_forward_flops, get_gpu_peak_tflops
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +129,34 @@ def _get_xla_device(torch_xla_mod, xm):
     return xm.xla_device()
 
 
+def _xla_metric_summary(xla_metrics):
+    if xla_metrics is None:
+        return None
+
+    def metric_seconds(name):
+        try:
+            total_samples, accumulator, _samples = xla_metrics.metric_data(name)
+        except Exception:
+            return 0, 0.0
+        # PyTorch/XLA reports time accumulators in nanoseconds.
+        return int(total_samples), float(accumulator) / 1e9
+
+    compile_count, compile_s = metric_seconds("CompileTime")
+    execute_count, execute_s = metric_seconds("ExecuteTime")
+    transfer_to_count, transfer_to_s = metric_seconds("TransferToDeviceTime")
+    transfer_from_count, transfer_from_s = metric_seconds("TransferFromDeviceTime")
+    return {
+        "compile_count": compile_count,
+        "compile_s": compile_s,
+        "execute_count": execute_count,
+        "execute_s": execute_s,
+        "transfer_to_count": transfer_to_count,
+        "transfer_to_s": transfer_to_s,
+        "transfer_from_count": transfer_from_count,
+        "transfer_from_s": transfer_from_s,
+    }
+
+
 # ---------------------------------------------------------------------------
 # DDP helpers
 # ---------------------------------------------------------------------------
@@ -175,6 +203,7 @@ class ModelEMA:
 def main(rank, world_size, args, gpu_id):
     torch_xla_mod = None
     xm = None
+    xla_metrics = None
 
     # Conditional model import
     if args.use_te:
@@ -252,6 +281,7 @@ def main(rank, world_size, args, gpu_id):
     if args.device == "xla":
         os.environ.setdefault("PJRT_DEVICE", "TPU")
         torch_xla_mod, xm = _import_xla()
+        import torch_xla.debug.metrics as xla_metrics
         device = _get_xla_device(torch_xla_mod, xm)
     elif args.device in ("auto", "cuda") and torch.cuda.is_available():
         torch.cuda.set_device(gpu_id)
@@ -566,10 +596,11 @@ def main(rank, world_size, args, gpu_id):
     # FLOPs estimation
     forward_flops = estimate_forward_flops(model_config, pos_len, score_mode=args.score_mode)
     train_flops_per_sample = 3 * forward_flops
-    gpu_peak_tflops = get_gpu_peak_tflops(device)
+    device_peak_tflops = args.xla_peak_tflops if device.type == "xla" else get_gpu_peak_tflops(device)
     logging.info(f"FLOPs/sample (fwd): {forward_flops/1e9:.2f}G, (train): {train_flops_per_sample/1e9:.2f}G")
-    if gpu_peak_tflops > 0:
-        logging.info(f"GPU BF16 peak: {gpu_peak_tflops:.1f} TFLOPS")
+    if device_peak_tflops > 0:
+        peak_label = "XLA BF16 peak" if device.type == "xla" else "GPU BF16 peak"
+        logging.info(f"{peak_label}: {device_peak_tflops:.1f} TFLOPS")
 
     num_heads = model_config["num_heads"]
 
@@ -577,6 +608,7 @@ def main(rank, world_size, args, gpu_id):
     grad_accum_steps = args.grad_accum_steps
     samples_per_step = batch_size * world_size * grad_accum_steps
     use_hzy_schedule = (args.lr_schedule == "hzy")
+    use_constant_schedule = (args.lr_schedule == "constant")
 
     if use_hzy_schedule:
         # HZY step-function LR/WD schedule (from lr_schedule.xlsx)
@@ -606,6 +638,10 @@ def main(rank, world_size, args, gpu_id):
         base_lr, base_wd = get_lr_wd(total_samples_trained)
         logging.info(f"HZY LR/WD schedule: {len(_LR_WD_SCHEDULE)} stages, "
                      f"current lr={base_lr:.2e}, wd={base_wd:.4f} at {total_samples_trained} samples")
+    elif use_constant_schedule:
+        base_lr = args.lr
+        base_wd = args.wd
+        logging.info(f"Constant LR/WD schedule: lr={base_lr:.2e}, wd={base_wd:.4f}")
     else:
         base_lr = args.lr
         base_wd = args.wd
@@ -713,9 +749,9 @@ def main(rank, world_size, args, gpu_id):
     else:
         grad_reducer = None
 
-    # Cosine LR schedule (when not using HZY)
+    # Cosine LR schedule (when requested)
     scheduler = None
-    if not use_hzy_schedule:
+    if args.lr_schedule == "cosine":
         warmup_steps = args.warmup_samples // samples_per_step
         total_steps = args.max_training_samples // samples_per_step
 
@@ -877,8 +913,25 @@ def main(rank, world_size, args, gpu_id):
         weight_sum = max(running["wsum"], 1e-10)
         batch_count = max(running["count"], 1)
         samples_per_sec = batch_count * batch_size * world_size * grad_accum_steps / elapsed
-        achieved_tflops_per_gpu = samples_per_sec * train_flops_per_sample / (world_size * 1e12)
-        mfu = achieved_tflops_per_gpu / gpu_peak_tflops * 100.0 if gpu_peak_tflops > 0 else 0.0
+        achieved_tflops_per_device = samples_per_sec * train_flops_per_sample / (world_size * 1e12)
+        mfu = achieved_tflops_per_device / device_peak_tflops * 100.0 if device_peak_tflops > 0 else 0.0
+        xla_summary = _xla_metric_summary(xla_metrics)
+        xla_extra = ""
+        if xla_summary is not None:
+            window_samples = batch_count * batch_size * world_size * grad_accum_steps
+            execute_s = xla_summary["execute_s"]
+            execute_tflops = (
+                window_samples * train_flops_per_sample / (world_size * execute_s * 1e12)
+                if execute_s > 0 else 0.0
+            )
+            execute_mfu = execute_tflops / device_peak_tflops * 100.0 if device_peak_tflops > 0 else 0.0
+            xla_extra = (
+                f", xla_compile={xla_summary['compile_s']:.1f}s/{xla_summary['compile_count']}, "
+                f"xla_execute={execute_s:.1f}s/{xla_summary['execute_count']}, "
+                f"xla_mfu={execute_mfu:.2f}%, "
+                f"xla_h2d={xla_summary['transfer_to_s']:.1f}s/{xla_summary['transfer_to_count']}, "
+                f"xla_d2h={xla_summary['transfer_from_s']:.1f}s/{xla_summary['transfer_from_count']}"
+            )
         logging.info(
             f"step={global_step}, samples={total_samples_trained}, "
             f"time={elapsed:.1f}s, "
@@ -889,7 +942,8 @@ def main(rank, world_size, args, gpu_id):
             f"oloss={running['oloss'] / weight_sum:.4f}, "
             f"skloss={running['skloss'] / weight_sum:.4f}, "
             f"pacc1={running['pacc1'] / weight_sum:.4f}, "
-            f"sps={samples_per_sec:.0f}, MFU={mfu:.1f}%"
+            f"sps={samples_per_sec:.1f}, TFLOPS={achieved_tflops_per_device:.2f}, "
+            f"MFU={mfu:.2f}%{xla_extra}"
         )
         if tb_writer is not None:
             tb_writer.add_scalar("train/loss", running["loss"] / batch_count, total_samples_trained)
@@ -905,13 +959,15 @@ def main(rank, world_size, args, gpu_id):
             tokens_per_sec = samples_per_sec * pos_len * pos_len
             tb_writer.add_scalar("perf/samples_per_sec", samples_per_sec, total_samples_trained)
             tb_writer.add_scalar("perf/tokens_per_sec", tokens_per_sec, total_samples_trained)
-            tb_writer.add_scalar("perf/achieved_tflops_per_gpu", achieved_tflops_per_gpu, total_samples_trained)
+            tb_writer.add_scalar("perf/achieved_tflops_per_device", achieved_tflops_per_device, total_samples_trained)
             tb_writer.add_scalar("perf/mfu", mfu, total_samples_trained)
             if grad_scaler is not None:
                 tb_writer.add_scalar("train/grad_scale", grad_scaler.get_scale(), total_samples_trained)
         profile_line = profiler.report_and_reset()
         if profile_line is not None:
             logging.info(f"  {profile_line}")
+        if xla_metrics is not None:
+            xla_metrics.clear_all()
 
     # Start training
     effective_batch = batch_size * world_size * grad_accum_steps
@@ -920,6 +976,8 @@ def main(rank, world_size, args, gpu_id):
     logging.info(f"Effective batch size: {effective_batch} (micro={batch_size} x gpus={world_size} x accum={grad_accum_steps})")
     logging.info(f"AMP: dtype={args.amp_dtype}, GradScaler={'yes (scale=%.1f)' % grad_scaler.get_scale() if grad_scaler is not None else 'no'}")
     logging.info("=" * 60)
+    if xla_metrics is not None:
+        xla_metrics.clear_all()
 
     last_save_samples = total_samples_trained
     last_val_samples = total_samples_trained
@@ -1206,9 +1264,11 @@ def main(rank, world_size, args, gpu_id):
                     val_files = sorted(glob.glob(os.path.join(val_dir, "*.npz")))
                     if val_files:
                         model.eval()
-                        val_metrics = {k: 0.0 for k in _metric_keys}
-                        val_metrics["count"] = 0
+                        val_metrics_t = None
+                        val_count_t = torch.zeros((), device=device)
                         with torch.no_grad():
+                            moving_sum_t = torch.tensor(model.moving_unowned_proportion_sum, device=device)
+                            moving_weight_t = torch.tensor(model.moving_unowned_proportion_weight, device=device)
                             val_gen = data_processing.read_npz_training_data(
                                 val_files[:3],
                                 batch_size=batch_size,
@@ -1224,13 +1284,17 @@ def main(rank, world_size, args, gpu_id):
                                 varlen=args.varlen,
                                 allow_nonfull_mask=args.allow_nonfull_mask,
                             )
-                            for val_batch in data_processing.prefetch_generator(val_gen, args.prefetch_batches):
+                            for val_batch_idx, val_batch in enumerate(data_processing.prefetch_generator(val_gen, args.prefetch_batches)):
+                                if args.max_val_batches > 0 and val_batch_idx >= args.max_val_batches:
+                                    break
                                 with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
                                     outputs = model(val_batch["binaryInputNCHW"], val_batch["globalInputNC"])
                                 val_mask = val_batch["binaryInputNCHW"][:, 0:1, :, :].contiguous() if args.varlen else None
-                                _, batch_metrics = compute_loss(
-                                    model, outputs, val_batch, pos_len,
-                                    is_training=False,
+                                _, batch_metrics_t, _, _ = postprocess_and_loss_core(
+                                    outputs, model.value_head.score_belief_offset_vector,
+                                    val_batch["policyTargetsNCMove"],
+                                    val_batch["globalTargetsNC"], val_batch["scoreDistrN"], val_batch["valueTargetsNCHW"],
+                                    pos_len, moving_sum_t, moving_weight_t, False,
                                     soft_policy_weight_scale=args.soft_policy_weight_scale,
                                     value_loss_scale=args.value_loss_scale,
                                     td_value_loss_scales=td_value_loss_scales,
@@ -1239,17 +1303,25 @@ def main(rank, world_size, args, gpu_id):
                                     disable_optimistic_policy=args.disable_optimistic_policy,
                                     mask=val_mask,
                                 )
-                                for k in batch_metrics:
-                                    val_metrics[k] += batch_metrics[k]
-                                val_metrics["count"] += 1
+                                if val_metrics_t is None:
+                                    val_metrics_t = torch.zeros_like(batch_metrics_t)
+                                val_metrics_t = val_metrics_t + batch_metrics_t
+                                val_count_t = val_count_t + 1.0
+                        if args.max_val_batches > 0 and rank == 0:
+                            logging.info(f"  VAL limited to {args.max_val_batches} batches")
 
-                        # Aggregate metrics across all ranks
+                        if val_metrics_t is None:
+                            val_metrics_t = torch.zeros(len(_metric_keys), device=device)
+                        val_values_t = torch.cat([val_metrics_t, val_count_t.reshape(1)])
+
+                        # Aggregate metrics across all ranks and move to host once.
                         if world_size > 1:
-                            agg_keys = _metric_keys + ["count"]
-                            agg_vals = torch.tensor([val_metrics[k] for k in agg_keys], device=device)
-                            torch.distributed.all_reduce(agg_vals, op=torch.distributed.ReduceOp.SUM)
-                            for i, k in enumerate(agg_keys):
-                                val_metrics[k] = agg_vals[i].item()
+                            torch.distributed.all_reduce(val_values_t, op=torch.distributed.ReduceOp.SUM)
+                        if device.type == "xla":
+                            sync_xla_if_needed()
+                        val_values = val_values_t.detach().cpu().tolist()
+                        val_metrics = dict(zip(_metric_keys, val_values[:-1]))
+                        val_metrics["count"] = val_values[-1]
 
                         if rank == 0:
                             weight_sum = max(val_metrics["wsum"], 1e-10)
@@ -1305,8 +1377,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-heads", type=int, default=6, help="Number of attention heads")
     parser.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate (cosine schedule)")
     parser.add_argument("--wd", type=float, default=0.1, help="Weight decay (cosine schedule)")
-    parser.add_argument("--lr-schedule", type=str, default="cosine", choices=["cosine", "hzy"],
-                        help="LR schedule: cosine (warmup+cosine decay) or hzy (step-function from lr_schedule.xlsx)")
+    parser.add_argument("--lr-schedule", type=str, default="cosine", choices=["cosine", "hzy", "constant"],
+                        help="LR schedule: cosine, hzy (step-function from lr_schedule.xlsx), or constant")
     parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "muon", "shampoo"],
                         help="Optimizer: adam (pure AdamW), muon (Muon for blocks + AdamW), shampoo (Shampoo for blocks + AdamW)")
     parser.add_argument("--shampoo-lr-multiplier", type=float, default=2.0, help="Shampoo LR multiplier over base lr")
@@ -1318,6 +1390,8 @@ if __name__ == "__main__":
                              "'all' applies all 8 symmetries per sample, requires batch-size divisible by 8")
     parser.add_argument("--print-every", type=int, default=100, help="Print every N optimizer steps")
     parser.add_argument("--val-every-samples", type=int, default=1000000, help="Run validation every N samples")
+    parser.add_argument("--max-val-batches", type=int, default=0,
+                        help="Maximum validation batches per validation run (0=all)")
     parser.add_argument("--warmup-samples", type=int, default=2000000, help="LR warmup samples")
     parser.add_argument("--enable-history-matrices", action="store_true", help="Enable history matrices (for Go)")
     parser.add_argument("--initial-checkpoint", type=str, default=None, help="Initial checkpoint to load from")
@@ -1347,6 +1421,8 @@ if __name__ == "__main__":
                         help="AMP dtype: bf16 (default), fp16 (with loss scaling), none (disable AMP)")
     parser.add_argument("--profile", action="store_true",
                         help="Enable per-stage CUDA-synced profiling (adds sync overhead)")
+    parser.add_argument("--xla-peak-tflops", type=float, default=918.0,
+                        help="BF16 peak TFLOPS per XLA device for MFU reporting (v6e=918)")
     parser.add_argument("--no-tensorboard", action="store_true",
                         help="Disable TensorBoard logging")
     parser.add_argument("--ema-decay", type=float, default=0.0,

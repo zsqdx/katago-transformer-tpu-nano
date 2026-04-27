@@ -41,6 +41,77 @@ The first few optimizer steps may take several seconds while XLA traces and
 compiles the graph. Later steps should get much faster once the compiled graph
 is cached.
 
+## Colab TPU Monitor Cell
+
+Run this in a separate notebook cell while `train.sh` is running. It displays
+the latest training log lines plus `tpu-info` live TPU status. It requests HBM
+usage, duty cycle, TensorCore utilization, and power metrics when the current
+Colab/libtpu runtime exposes them.
+
+```python
+import pathlib
+import subprocess
+import time
+from IPython.display import clear_output
+
+LOG = pathlib.Path("/content/katago-transformer-tpu-nano/tpu_real_run/train0.log")
+
+def run(cmd, timeout=10):
+    out = subprocess.run(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=timeout,
+        check=False,
+    )
+    return out.stdout
+
+while True:
+    clear_output(wait=True)
+    print(time.strftime("%Y-%m-%d %H:%M:%S"))
+    print("\n=== train0.log tail ===")
+    if LOG.exists():
+        print("\n".join(LOG.read_text(errors="replace").splitlines()[-20:]))
+    else:
+        print(f"{LOG} not found yet")
+
+    try:
+        list_metrics = run(["tpu-info", "--list_metrics"])
+        requested = [
+            name for name in (
+                "duty_cycle_percent",
+                "hbm_usage",
+                "tensorcore_utilization",
+                "power",
+                "power_usage",
+                "chip_power",
+                "total_power",
+            )
+            if name in list_metrics
+        ]
+    except Exception:
+        requested = []
+
+    commands = []
+    if requested:
+        commands.append(["tpu-info", "--metric", *requested])
+    commands.extend((["tpu-info"], ["tpu-info", "--process"]))
+
+    for cmd in commands:
+        print("\n=== " + " ".join(cmd) + " ===")
+        try:
+            print(run(cmd))
+        except Exception as exc:
+            print(f"{' '.join(cmd)} failed: {exc}")
+
+    time.sleep(5)
+```
+
+Training logs also report TPU MFU. For XLA runs, the normal `MFU` is wall-clock
+MFU including compile/data overhead, while `xla_mfu` is based on XLA
+`ExecuteTime` and is closer to device execution MFU.
+
 ## Fixing `_XLAC` Import Errors
 
 If `import torch_xla` fails with an error like:
@@ -88,11 +159,20 @@ bash train.sh
 - a local `./val` directory. If only `./val` exists, the script uses it for both
   training and validation as a pipeline smoke test.
 
-The script defaults to `model-kind=b12c192`, `batch-size=16`, and
-`max-training-samples=1024`. Override them with environment variables:
+The script defaults to `model-kind=b12c192`, `batch-size=16`,
+`max-training-samples=1024`, constant LR, and validation capped to 16 batches.
+Constant LR avoids recompiling the XLA optimizer graph every step during short
+smoke tests. Validation metrics are accumulated on-device and copied to the
+host once per validation pass. Override settings with environment variables:
 
 ```bash
 BATCH_SIZE=32 MAX_TRAINING_SAMPLES=4096 bash train.sh
+```
+
+For a full validation pass on all validation rows:
+
+```bash
+MAX_VAL_BATCHES=0 bash train.sh
 ```
 
 For reference, the command expanded by `train.sh` is equivalent to:
@@ -107,16 +187,19 @@ python -u train.py \
   --batch-size 16 \
   --model-kind b12c192 \
   --lr 2e-4 \
+  --lr-schedule constant \
   --max-training-samples 1024 \
   --symmetry-type xyt \
   --print-every 1 \
   --save-every-samples 1024 \
   --val-every-samples 1024 \
+  --max-val-batches 16 \
   --warmup-samples 256 \
   --prefetch-batches 0 \
   --no-compile \
   --no-tensorboard \
   --allow-nonfull-mask \
+  --xla-peak-tflops 918 \
   --amp-dtype bf16
 ```
 
