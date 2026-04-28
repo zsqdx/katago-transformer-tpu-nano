@@ -233,6 +233,7 @@ def main():
     parser.add_argument("--log-grad-norm", action="store_true")
     parser.add_argument("--donate-train-buffers", action="store_true")
     parser.add_argument("--scan-blocks", action="store_true")
+    parser.add_argument("--remat-blocks", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--init-std", type=float, default=0.02)
     parser.add_argument("--score-mode", type=str, default="simple", choices=["simple"])
@@ -328,7 +329,8 @@ def main():
         outputs = jax_model.forward(params_, batch_["binaryInputNCHW"], batch_["globalInputNC"],
                                     model_config, args.pos_len, rope_cache,
                                     attention_impl=args.attention_impl,
-                                    activation_dtype=activation_dtype)
+                                    activation_dtype=activation_dtype,
+                                    remat_blocks=args.remat_blocks)
         return jax_losses.postprocess_and_loss_core(
             outputs,
             score_offsets,
@@ -447,6 +449,7 @@ def main():
             "param_dtype": args.param_dtype,
             "opt_state_dtype": args.opt_state_dtype,
             "scan_blocks": args.scan_blocks,
+            "remat_blocks": args.remat_blocks,
         }
 
     def log_metric_summary(prefix, samples, metrics_host, batch_count):

@@ -262,6 +262,7 @@ def forward(
     rope_cache,
     attention_impl="manual",
     activation_dtype=jnp.float32,
+    remat_blocks=False,
 ):
     c = config["hidden_size"]
     num_heads = config["num_heads"]
@@ -274,30 +275,29 @@ def forward(
     x = jnp.transpose(x.reshape(n, c, seq_len), (0, 2, 1))
 
     rope_cos, rope_sin = rope_cache
+
+    def apply_block(block, x_in):
+        return transformer_block(
+            block,
+            x_in,
+            rope_cos,
+            rope_sin,
+            num_heads,
+            attention_impl=attention_impl,
+            activation_dtype=activation_dtype,
+        )
+
+    if remat_blocks:
+        apply_block = jax.checkpoint(apply_block)
+
     if isinstance(params["blocks"], dict):
         def scan_body(x_carry, block):
-            return transformer_block(
-                block,
-                x_carry,
-                rope_cos,
-                rope_sin,
-                num_heads,
-                attention_impl=attention_impl,
-                activation_dtype=activation_dtype,
-            ), None
+            return apply_block(block, x_carry), None
 
         x, _ = jax.lax.scan(scan_body, x, params["blocks"])
     else:
         for block in params["blocks"]:
-            x = transformer_block(
-                block,
-                x,
-                rope_cos,
-                rope_sin,
-                num_heads,
-                attention_impl=attention_impl,
-                activation_dtype=activation_dtype,
-            )
+            x = apply_block(block, x)
     x = rms_norm(params["norm_final"], x).astype(jnp.float32)
 
     board = jnp.transpose(linear(params["policy_head"]["linear_board"], x), (0, 2, 1))

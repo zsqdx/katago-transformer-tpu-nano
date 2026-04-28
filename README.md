@@ -151,8 +151,11 @@ Set `DONATE_TRAIN_BUFFERS=1` to let JAX donate the parameter buffers across
 each compiled train call; this may reduce memory pressure, but it is kept
 opt-in because broader donation can expose buffer-aliasing issues.
 Set `SCAN_BLOCKS=1` to store transformer block parameters as stacked layer
-arrays and run the trunk with `jax.lax.scan`, which is useful for profiling
-deeper models such as `b24c1024`.
+arrays and run the trunk with `jax.lax.scan`; this can reduce compile latency,
+but early `b24c1024` TPU profiling showed lower stable throughput than the
+unscanned loop. Set `REMAT_BLOCKS=1` to checkpoint/rematerialize each
+transformer block, which trades extra recomputation for lower activation memory
+pressure and is intended as a separate throughput A/B.
 
 ## CUDA Training Example
 

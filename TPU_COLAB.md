@@ -485,8 +485,10 @@ Set `DONATE_TRAIN_BUFFERS=1` to let JAX donate parameter buffers across each
 compiled train call. This can reduce memory pressure, but it is opt-in because
 broader donation can expose buffer-aliasing issues on some runs.
 Set `SCAN_BLOCKS=1` to store transformer block parameters as stacked layer
-arrays and run the trunk with `jax.lax.scan`, which can be useful for deeper
-models such as `b24c1024`.
+arrays and run the trunk with `jax.lax.scan`; this can reduce compile latency,
+but early `b24c1024` profiling showed lower stable throughput than the regular
+Python-unrolled block loop. Set `REMAT_BLOCKS=1` to checkpoint/rematerialize
+each transformer block as a separate activation-memory A/B.
 
 For reference, the command expanded by `train.sh` is equivalent to:
 
