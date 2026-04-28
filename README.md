@@ -183,6 +183,9 @@ Muon's optimizer work is not included in the standard model-FLOPs MFU log, and
 full-matrix Muon on wide FFN weights can dominate wall time. Set
 `MUON_ROW_SPLIT_SIZE=256` to split large block matrices into row chunks before
 the polar iteration; try `128`, `256`, and `512` as TPU throughput/quality A/Bs.
+For faster Muon probes, set `MUON_TARGET=attn`, `ffn`, `square`, or `none`
+instead of the default `all`; non-targeted leaves fall back to AdamW. You can
+also set `MUON_POLAR_STEPS=3` or `4` to trade optimizer precision for speed.
 Muon normally compiles as one train-step JIT so XLA can keep gradients inside
 the compiled program. If that compile stalls on a larger shape, set
 `MUON_SPLIT_JIT=1` as a slower fallback that compiles loss/grad and optimizer

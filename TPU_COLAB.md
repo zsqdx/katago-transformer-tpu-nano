@@ -515,6 +515,9 @@ full-matrix Muon on the wide FFN weights can dominate wall time. Set
 `MUON_ROW_SPLIT_SIZE=256` to split large block matrices into row chunks before
 the polar iteration; compare `128`, `256`, and `512` for throughput and loss
 behavior.
+For faster Muon probes, set `MUON_TARGET=attn`, `ffn`, `square`, or `none`
+instead of the default `all`; non-targeted leaves fall back to AdamW. You can
+also set `MUON_POLAR_STEPS=3` or `4` to trade optimizer precision for speed.
 Muon normally uses one train-step JIT so gradients stay inside the compiled
 program. If a larger Muon shape stalls during compilation, set
 `MUON_SPLIT_JIT=1` as a slower fallback that compiles loss/grad and optimizer

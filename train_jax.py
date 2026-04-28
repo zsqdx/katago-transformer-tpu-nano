@@ -183,23 +183,42 @@ _POLAR_EXPRESS_COEFFS = (
 )
 
 
-def _is_muon_path(path, leaf):
+def _muon_target_matches_path(path, target):
+    target = str(target).lower()
+    if target == "all":
+        return True
+    if target == "none":
+        return False
+    if target == "attn":
+        return any(part in ("q_proj", "k_proj", "v_proj", "qkv_proj", "out_proj") for part in path)
+    if target == "ffn":
+        return any(part in ("ffn_w1", "ffn_wgate", "ffn_w2", "ffn_upgate") for part in path)
+    if target == "square":
+        return True
+    raise ValueError(f"Unknown Muon target: {target}")
+
+
+def _is_muon_path(path, leaf, target="all"):
     if not path or path[0] != "blocks" or path[-1] != "w":
         return False
-    return getattr(leaf, "ndim", 0) >= 2
+    if getattr(leaf, "ndim", 0) < 2:
+        return False
+    if str(target).lower() == "square" and leaf.shape[-2] != leaf.shape[-1]:
+        return False
+    return _muon_target_matches_path(path, target)
 
 
 def _is_qkv_projection_path(path):
     return any(part in ("q_proj", "k_proj", "v_proj", "qkv_proj") for part in path)
 
 
-def init_muon_adamw_state(params, dtype=None):
+def init_muon_adamw_state(params, dtype=None, muon_target="all"):
     import jax.numpy as jnp
 
     state_dtype = jnp.float32 if dtype is None else dtype
 
     def init_v(path, p):
-        if _is_muon_path(path, p):
+        if _is_muon_path(path, p, muon_target):
             return jnp.zeros((), dtype=state_dtype)
         return jnp.zeros(p.shape, dtype=state_dtype)
 
@@ -265,7 +284,7 @@ def _tree_from_leaf_values(template, values, index=None, path=()):
     return value[index]
 
 
-def polar_express_jax(g):
+def polar_express_jax(g, steps=5):
     import jax.numpy as jnp
 
     x = g.astype(jnp.bfloat16)
@@ -276,7 +295,7 @@ def polar_express_jax(g):
     norm = jnp.sqrt(jnp.sum(jnp.square(x.astype(jnp.float32)), axis=(-2, -1), keepdims=True))
     x = (x / (norm.astype(jnp.float32) * 1.02 + 1e-6)).astype(jnp.bfloat16)
 
-    for a, b, c in _POLAR_EXPRESS_COEFFS:
+    for a, b, c in _POLAR_EXPRESS_COEFFS[:steps]:
         a_v = jnp.asarray(a, dtype=jnp.bfloat16)
         b_v = jnp.asarray(b, dtype=jnp.bfloat16)
         c_v = jnp.asarray(c, dtype=jnp.bfloat16)
@@ -307,6 +326,8 @@ def muon_adamw_update(
     muon_lr_multiplier=0.2,
     muon_momentum=0.95,
     muon_row_split_size=0,
+    muon_target="all",
+    muon_polar_steps=5,
 ):
     import jax.numpy as jnp
 
@@ -339,7 +360,7 @@ def muon_adamw_update(
     def muon_update_leaf(path, p, g, m, v):
         new_m_leaf = muon_momentum_v * m.astype(update_dtype) + g.astype(update_dtype)
         split_update = _muon_split_for_path(path, new_m_leaf, num_heads, muon_row_split_size)
-        split_update = polar_express_jax(split_update)
+        split_update = polar_express_jax(split_update, steps=muon_polar_steps)
         scale = math.sqrt(max(split_update.shape[-2], split_update.shape[-1]))
         update = (split_update * jnp.asarray(scale, dtype=split_update.dtype)).reshape(p.shape)
         p_new = p.astype(update_dtype) * (one_v - lr_v * wd_v)
@@ -350,7 +371,7 @@ def muon_adamw_update(
         g = _get_path(grads, path)
         m = _get_path(state["m"], path)
         v = _get_path(state["v"], path)
-        if _is_muon_path(path, p):
+        if _is_muon_path(path, p, muon_target):
             return muon_update_leaf(path, p, g, m, v)
         return adam_update_leaf(path, p, g, m, v)
 
@@ -384,7 +405,7 @@ def muon_adamw_update(
             p_stack = jnp.stack([_get_path(block, leaf_path) for block in params["blocks"]], axis=0)
             g_stack = jnp.stack([_get_path(block, leaf_path) for block in grads["blocks"]], axis=0)
             m_stack = jnp.stack([_get_path(block, leaf_path) for block in state["m"]["blocks"]], axis=0)
-            if _is_muon_path(full_path, p_stack):
+            if _is_muon_path(full_path, p_stack, muon_target):
                 v_values = [_get_path(block, leaf_path) for block in state["v"]["blocks"]]
                 p_new, m_new, _ = muon_update_leaf(
                     full_path,
@@ -489,34 +510,48 @@ def estimate_forward_component_flops(config, pos_len, score_mode="simple"):
     }
 
 
-def estimate_muon_update_flops(config, row_split_size=0, fuse_projections=False):
+def estimate_muon_update_flops(config, row_split_size=0, fuse_projections=False, muon_target="all", polar_steps=5):
     d = config["hidden_size"]
     heads = config["num_heads"]
     ff = config["ffn_dim"]
     layers = config["num_layers"]
+    target = str(muon_target).lower()
 
     def polar_flops(m, n):
         if m > n:
             m, n = n, m
-        return 5 * (4 * m * m * n + 2 * m * m * m)
+        return polar_steps * (4 * m * m * n + 2 * m * m * m)
 
     def split_flops(m, n):
         if row_split_size > 0 and m > row_split_size and m % row_split_size == 0:
             return (m // row_split_size) * polar_flops(row_split_size, n)
         return polar_flops(m, n)
 
+    def include(kind, m, n):
+        if target == "none":
+            return 0
+        if target == "all":
+            return split_flops(m, n)
+        if target == "attn" and kind == "attn":
+            return split_flops(m, n)
+        if target == "ffn" and kind == "ffn":
+            return split_flops(m, n)
+        if target == "square" and m == n:
+            return split_flops(m, n)
+        return 0
+
     head_dim = d // heads
     if fuse_projections:
-        qkv = 3 * heads * polar_flops(head_dim, d)
-        per_layer = qkv + split_flops(d, d) + split_flops(2 * ff, d) + split_flops(d, ff)
+        qkv = 0 if target in ("none", "ffn", "square") else 3 * heads * polar_flops(head_dim, d)
+        per_layer = qkv + include("attn", d, d) + include("ffn", 2 * ff, d) + include("ffn", d, ff)
     else:
-        qkv = 3 * heads * polar_flops(head_dim, d)
+        qkv = 0 if target in ("none", "ffn") else 3 * heads * polar_flops(head_dim, d)
         per_layer = (
             qkv
-            + split_flops(d, d)
-            + split_flops(ff, d)
-            + split_flops(ff, d)
-            + split_flops(d, ff)
+            + include("attn", d, d)
+            + include("ffn", ff, d)
+            + include("ffn", ff, d)
+            + include("ffn", d, ff)
         )
     return layers * per_layer
 
@@ -576,6 +611,8 @@ def main():
     parser.add_argument("--muon-lr-multiplier", type=float, default=0.2)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
     parser.add_argument("--muon-row-split-size", type=int, default=0)
+    parser.add_argument("--muon-target", type=str, default="all", choices=["all", "attn", "ffn", "square", "none"])
+    parser.add_argument("--muon-polar-steps", type=int, default=5)
     parser.add_argument("--loss-profile", type=str, default="full",
                         choices=["full", "policy_value", "policy_only", "value_only"])
     parser.add_argument("--grad-clip-norm", type=float, default=0.0)
@@ -630,6 +667,8 @@ def main():
         raise ValueError("--component-profile-repeats must be >= 1")
     if args.muon_row_split_size < 0:
         raise ValueError("--muon-row-split-size must be >= 0")
+    if args.muon_polar_steps < 1 or args.muon_polar_steps > len(_POLAR_EXPRESS_COEFFS):
+        raise ValueError(f"--muon-polar-steps must be between 1 and {len(_POLAR_EXPRESS_COEFFS)}")
     track_grad_norm = args.log_grad_norm or args.grad_clip_norm > 0
 
     try:
@@ -696,6 +735,11 @@ def main():
                 f"{checkpoint_path}: checkpoint optimizer={meta.get('optimizer')} does not match "
                 f"--optimizer={args.optimizer}; set NO_RESUME=1 when switching optimizers"
             )
+        if args.optimizer == "muon" and meta.get("muon_target", "all") != args.muon_target:
+            raise ValueError(
+                f"{checkpoint_path}: checkpoint muon_target={meta.get('muon_target', 'all')} does not match "
+                f"--muon-target={args.muon_target}; set NO_RESUME=1 when changing Muon target"
+            )
         state_params = state["params"]
         expected_stacked_blocks = args.stack_blocks or args.scan_blocks
         if isinstance(state_params.get("blocks"), dict) != expected_stacked_blocks:
@@ -721,7 +765,11 @@ def main():
         params = _tree_map(lambda x: x.astype(param_dtype), params)
         params = jax.device_put(params)
         if args.optimizer == "muon":
-            opt_state = jax.device_put(init_muon_adamw_state(params, dtype=opt_state_dtype))
+            opt_state = jax.device_put(init_muon_adamw_state(
+                params,
+                dtype=opt_state_dtype,
+                muon_target=args.muon_target,
+            ))
         else:
             opt_state = jax.device_put(init_adam_state(params, dtype=opt_state_dtype))
 
@@ -794,6 +842,8 @@ def main():
                 muon_lr_multiplier=args.muon_lr_multiplier,
                 muon_momentum=args.muon_momentum,
                 muon_row_split_size=args.muon_row_split_size,
+                muon_target=args.muon_target,
+                muon_polar_steps=args.muon_polar_steps,
             )
         elif args.optimizer == "sgd":
             new_params = sgd_update(
@@ -881,6 +931,8 @@ def main():
             muon_lr_multiplier=args.muon_lr_multiplier,
             muon_momentum=args.muon_momentum,
             muon_row_split_size=args.muon_row_split_size,
+            muon_target=args.muon_target,
+            muon_polar_steps=args.muon_polar_steps,
         )
 
     muon_update_donate_argnums = (0, 1) if args.donate_train_buffers else ()
@@ -912,11 +964,15 @@ def main():
             model_config,
             row_split_size=args.muon_row_split_size,
             fuse_projections=args.fuse_projections and not args.separate_projections,
+            muon_target=args.muon_target,
+            polar_steps=args.muon_polar_steps,
         )
         logging.info(
-            "Muon update approx FLOPs/step=%.2fT (row_split=%d). "
+            "Muon update approx FLOPs/step=%.2fT (target=%s, polar_steps=%d, row_split=%d). "
             "The standard TFLOPS/MFU logs count model train FLOPs only.",
             muon_update_flops / 1e12,
+            args.muon_target,
+            args.muon_polar_steps,
             args.muon_row_split_size,
         )
         if args.muon_split_jit:
@@ -1256,6 +1312,8 @@ def main():
                     muon_lr_multiplier=args.muon_lr_multiplier,
                     muon_momentum=args.muon_momentum,
                     muon_row_split_size=args.muon_row_split_size,
+                    muon_target=args.muon_target,
+                    muon_polar_steps=args.muon_polar_steps,
                 )[0],
                 params,
                 grads,
@@ -1323,6 +1381,8 @@ def main():
             "muon_lr_multiplier": args.muon_lr_multiplier,
             "muon_momentum": args.muon_momentum,
             "muon_row_split_size": args.muon_row_split_size,
+            "muon_target": args.muon_target,
+            "muon_polar_steps": args.muon_polar_steps,
             "muon_split_jit": args.muon_split_jit,
             "loss_profile": args.loss_profile,
             "log_step_time": args.log_step_time,
