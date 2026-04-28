@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 SWEEP_ROOT="${SWEEP_ROOT:-./jax_shape_sweep_$(date +%Y%m%d_%H%M%S)}"
-SWEEP_SPECS="${SWEEP_SPECS:-b24c1024:16 b12c1536:16 b12c1536:32 b16c1536:16 b12c1792:16 b8c2048:16 b8c2048:32 b12c2048:16 b16c2048:8 b16c2048:16}"
+SWEEP_SPECS="${SWEEP_SPECS:-b24c1024:16 b12c1536:16 b12c1536:32 b16c1536:16 b12c1792:16 b8c2048:16 b8c2048:32 b10c2048:16 b12c2048:16 b14c2048:8 b16c2048:8 b16c2048:16 b18c2048:8}"
 SWEEP_SKIP_WINDOWS="${SWEEP_SKIP_WINDOWS:-1}"
 SWEEP_TEE="${SWEEP_TEE:-1}"
 SWEEP_COMPONENT_PROFILE="${SWEEP_COMPONENT_PROFILE:-0}"
@@ -134,10 +134,23 @@ def parse_args_line(text):
     return {}
 
 
+def parse_name_fallback(stem):
+    parts = stem.split("_")
+    if len(parts) >= 3 and parts[-1].startswith("b"):
+        batch = parts[-1][1:]
+        model = "_".join(parts[1:-1])
+        if model and batch:
+            return model, batch
+    return "?", "?"
+
+
 rows = []
 for log in logs:
     text = log.read_text(errors="replace")
     args = parse_args_line(text)
+    fallback_model, fallback_batch = parse_name_fallback(log.stem)
+    model = args.get("model_kind") or fallback_model
+    batch = args.get("batch_size") or fallback_batch
     train_rows = [
         {
             "step": int(m.group("step")),
@@ -167,8 +180,8 @@ for log in logs:
         row = {
             "status": status,
             "name": log.stem,
-            "model": args.get("model_kind", "?"),
-            "batch": args.get("batch_size", "?"),
+            "model": model,
+            "batch": batch,
             "best_mfu": stable[best_idx]["mfu"],
             "median_mfu": statistics.median(mfus),
             "last_mfu": stable[-1]["mfu"],
@@ -186,8 +199,8 @@ for log in logs:
         row = {
             "status": status,
             "name": log.stem,
-            "model": args.get("model_kind", "?"),
-            "batch": args.get("batch_size", "?"),
+            "model": model,
+            "batch": batch,
             "best_mfu": 0.0,
             "median_mfu": 0.0,
             "last_mfu": 0.0,

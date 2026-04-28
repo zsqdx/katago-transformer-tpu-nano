@@ -528,6 +528,10 @@ Set `SWEEP_COMPONENT_PROFILE=1` to also run the component microprofile for
 each candidate. The sweep disables final checkpoint saves to keep the search
 fast and disk-light.
 
+The default sweep includes the intermediate `c2048` depth probes `b10c2048`,
+`b14c2048`, and `b18c2048` so you can see whether the sweet spot sits between
+the known `b8c2048`, `b12c2048`, and `b16c2048` results.
+
 For reference, the command expanded by `train.sh` is equivalent to:
 
 ```bash

@@ -92,9 +92,9 @@ experiments, `train.sh` also exposes `GRAD_ACCUM_STEPS` and `GRAD_CLIP_NORM`
 environment overrides.
 
 Available TPU width presets include `b12c512`, `b12c768`, `b12c1024`,
-`b12c1536`, `b12c1792`, `b12c2048`, `b8c2048`, `b16c1536`, `b16c2048`, and
-`b24c1024` for checking whether a wider trunk improves TPU utilization over
-the default `b12c192`.
+`b12c1536`, `b12c1792`, `b8c2048`, `b10c2048`, `b12c2048`, `b14c2048`,
+`b16c1536`, `b16c2048`, `b18c2048`, and `b24c1024` for checking whether a
+wider trunk improves TPU utilization over the default `b12c192`.
 
 ## JAX TPU Prototype
 
