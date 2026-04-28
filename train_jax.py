@@ -221,6 +221,47 @@ def _muon_split_for_path(path, tensor, num_heads):
     return tensor
 
 
+def _leaf_paths(tree, path=()):
+    if isinstance(tree, dict):
+        paths = []
+        for k, v in tree.items():
+            paths.extend(_leaf_paths(v, path + (k,)))
+        return paths
+    if isinstance(tree, list):
+        paths = []
+        for i, v in enumerate(tree):
+            paths.extend(_leaf_paths(v, path + (str(i),)))
+        return paths
+    if isinstance(tree, tuple):
+        paths = []
+        for i, v in enumerate(tree):
+            paths.extend(_leaf_paths(v, path + (str(i),)))
+        return paths
+    return [path]
+
+
+def _tree_from_leaf_values(template, values, index=None, path=()):
+    if isinstance(template, dict):
+        return {
+            k: _tree_from_leaf_values(v, values, index=index, path=path + (k,))
+            for k, v in template.items()
+        }
+    if isinstance(template, list):
+        return [
+            _tree_from_leaf_values(v, values, index=index, path=path + (str(i),))
+            for i, v in enumerate(template)
+        ]
+    if isinstance(template, tuple):
+        return tuple(
+            _tree_from_leaf_values(v, values, index=index, path=path + (str(i),))
+            for i, v in enumerate(template)
+        )
+    value = values[path]
+    if index is None:
+        return value
+    return value[index]
+
+
 def polar_express_jax(g):
     import jax.numpy as jnp
 
@@ -280,20 +321,7 @@ def muon_adamw_update(
     muon_momentum_v = jnp.asarray(muon_momentum, dtype=update_dtype)
     num_heads = int(config["num_heads"])
 
-    def update_leaf(path, p):
-        g = _get_path(grads, path)
-        m = _get_path(state["m"], path)
-        v = _get_path(state["v"], path)
-        if _is_muon_path(path, p):
-            new_m_leaf = muon_momentum_v * m.astype(update_dtype) + g.astype(update_dtype)
-            split_update = _muon_split_for_path(path, new_m_leaf, num_heads)
-            split_update = polar_express_jax(split_update)
-            scale = math.sqrt(max(split_update.shape[-2], split_update.shape[-1]))
-            update = (split_update * jnp.asarray(scale, dtype=split_update.dtype)).reshape(p.shape)
-            p_new = p.astype(update_dtype) * (one_v - lr_v * wd_v)
-            p_new = p_new - muon_lr_v * update.astype(update_dtype)
-            return p_new.astype(param_dtype), new_m_leaf.astype(state_dtype), v
-
+    def adam_update_leaf(path, p, g, m, v):
         new_m_leaf = beta1_v * m.astype(update_dtype) + (one_v - beta1_v) * g.astype(update_dtype)
         new_v_leaf = beta2_v * v.astype(update_dtype) + (one_v - beta2_v) * jnp.square(g.astype(update_dtype))
         m_hat = new_m_leaf / bc1
@@ -304,6 +332,24 @@ def muon_adamw_update(
             p_new = p_new - lr_v * wd_v * p.astype(update_dtype)
         return p_new.astype(param_dtype), new_m_leaf.astype(state_dtype), new_v_leaf.astype(state_dtype)
 
+    def muon_update_leaf(path, p, g, m, v):
+        new_m_leaf = muon_momentum_v * m.astype(update_dtype) + g.astype(update_dtype)
+        split_update = _muon_split_for_path(path, new_m_leaf, num_heads)
+        split_update = polar_express_jax(split_update)
+        scale = math.sqrt(max(split_update.shape[-2], split_update.shape[-1]))
+        update = (split_update * jnp.asarray(scale, dtype=split_update.dtype)).reshape(p.shape)
+        p_new = p.astype(update_dtype) * (one_v - lr_v * wd_v)
+        p_new = p_new - muon_lr_v * update.astype(update_dtype)
+        return p_new.astype(param_dtype), new_m_leaf.astype(state_dtype), v
+
+    def update_leaf(path, p):
+        g = _get_path(grads, path)
+        m = _get_path(state["m"], path)
+        v = _get_path(state["v"], path)
+        if _is_muon_path(path, p):
+            return muon_update_leaf(path, p, g, m, v)
+        return adam_update_leaf(path, p, g, m, v)
+
     def extract_updated(tree, idx):
         if isinstance(tree, dict):
             return {k: extract_updated(v, idx) for k, v in tree.items()}
@@ -312,6 +358,66 @@ def muon_adamw_update(
         if isinstance(tree, tuple) and len(tree) == 3:
             return tree[idx]
         raise TypeError(f"Unexpected Muon update tree leaf: {type(tree)}")
+
+    if isinstance(params.get("blocks"), list):
+        new_params = {}
+        new_m = {}
+        new_v = {}
+        for key, subtree in params.items():
+            if key == "blocks":
+                continue
+            updated_subtree = _tree_map_with_path(lambda path, p: update_leaf((key,) + path, p), subtree)
+            new_params[key] = extract_updated(updated_subtree, 0)
+            new_m[key] = extract_updated(updated_subtree, 1)
+            new_v[key] = extract_updated(updated_subtree, 2)
+
+        block_template = params["blocks"][0]
+        block_param_values = {}
+        block_m_values = {}
+        block_v_values = {}
+        for leaf_path in _leaf_paths(block_template):
+            full_path = ("blocks",) + leaf_path
+            p_stack = jnp.stack([_get_path(block, leaf_path) for block in params["blocks"]], axis=0)
+            g_stack = jnp.stack([_get_path(block, leaf_path) for block in grads["blocks"]], axis=0)
+            m_stack = jnp.stack([_get_path(block, leaf_path) for block in state["m"]["blocks"]], axis=0)
+            if _is_muon_path(full_path, p_stack):
+                v_values = [_get_path(block, leaf_path) for block in state["v"]["blocks"]]
+                p_new, m_new, _ = muon_update_leaf(
+                    full_path,
+                    p_stack,
+                    g_stack,
+                    m_stack,
+                    v_values[0],
+                )
+                block_param_values[leaf_path] = p_new
+                block_m_values[leaf_path] = m_new
+                block_v_values[leaf_path] = v_values
+            else:
+                v_stack = jnp.stack([_get_path(block, leaf_path) for block in state["v"]["blocks"]], axis=0)
+                p_new, m_new, v_new = adam_update_leaf(
+                    full_path,
+                    p_stack,
+                    g_stack,
+                    m_stack,
+                    v_stack,
+                )
+                block_param_values[leaf_path] = p_new
+                block_m_values[leaf_path] = m_new
+                block_v_values[leaf_path] = v_new
+
+        new_params["blocks"] = [
+            _tree_from_leaf_values(block_template, block_param_values, index=i)
+            for i in range(len(params["blocks"]))
+        ]
+        new_m["blocks"] = [
+            _tree_from_leaf_values(block_template, block_m_values, index=i)
+            for i in range(len(params["blocks"]))
+        ]
+        new_v["blocks"] = [
+            _tree_from_leaf_values(block_template, block_v_values, index=i)
+            for i in range(len(params["blocks"]))
+        ]
+        return new_params, {"m": new_m, "v": new_v}
 
     updated = _tree_map_with_path(update_leaf, params)
     return (
@@ -697,6 +803,46 @@ def main():
     else:
         train_donate_argnums = ()
     train_steps = jax.jit(train_steps_impl, donate_argnums=train_donate_argnums)
+
+    def loss_grad_step_impl(params_, batch_, moving_sum_, moving_weight_):
+        def scalar_loss(p):
+            loss, metrics, new_moving_sum, new_moving_weight = loss_fn(
+                p, batch_, moving_sum_, moving_weight_, True
+            )
+            return loss, (metrics, new_moving_sum, new_moving_weight)
+
+        (_, (metrics, new_moving_sum, new_moving_weight)), grads = jax.value_and_grad(
+            scalar_loss, has_aux=True
+        )(params_)
+        if track_grad_norm:
+            grad_norm = jnp.sqrt(_tree_sum_squares(grads))
+        else:
+            grad_norm = jnp.asarray(0.0, dtype=jnp.float32)
+        if args.grad_clip_norm > 0:
+            scale = jnp.minimum(1.0, args.grad_clip_norm / (grad_norm + 1e-6))
+            grads = _tree_map(lambda g: g * scale, grads)
+        return grads, new_moving_sum, new_moving_weight, metrics, grad_norm
+
+    loss_grad_step = jax.jit(loss_grad_step_impl)
+
+    def muon_update_step_impl(params_, opt_state_, grads_, opt_step, lr, wd):
+        return muon_adamw_update(
+            params_,
+            grads_,
+            opt_state_,
+            opt_step,
+            lr,
+            wd,
+            model_config,
+            state_dtype=opt_state_dtype,
+            param_dtype=param_dtype,
+            update_dtype=opt_update_dtype,
+            muon_lr_multiplier=args.muon_lr_multiplier,
+            muon_momentum=args.muon_momentum,
+        )
+
+    muon_update_donate_argnums = (0, 1) if args.donate_train_buffers else ()
+    muon_update_step = jax.jit(muon_update_step_impl, donate_argnums=muon_update_donate_argnums)
 
     @jax.jit
     def eval_step(params_, batch_, moving_sum_, moving_weight_):
@@ -1185,22 +1331,49 @@ def main():
         start_step = step
         start_samples = total_samples
         batch_count = len(batch_list)
-        batch = jax.device_put(stack_batch_list(batch_list))
         lr_wd = [lr_wd_at_step(step + i, args, samples_per_step) for i in range(batch_count)]
         lrs = np.asarray([x[0] for x in lr_wd], dtype=np.float32)
         wds = np.asarray([x[1] for x in lr_wd], dtype=np.float32)
         opt_steps = np.arange(step + 1, step + batch_count + 1, dtype=np.float32)
         exec_start = time.perf_counter()
-        params, opt_state, moving_sum, moving_weight, metrics, grad_norm = train_steps(
-            params,
-            opt_state,
-            batch,
-            moving_sum,
-            moving_weight,
-            jnp.asarray(opt_steps),
-            jnp.asarray(lrs),
-            jnp.asarray(wds),
-        )
+        if args.optimizer == "muon":
+            if step == 0:
+                logging.info(
+                    "Muon uses split JIT execution: compiling loss/grad and optimizer update separately. "
+                    "The first chunk can still take a while, but it avoids one oversized train-step HLO."
+                )
+            metrics = jnp.zeros((len(jax_losses.METRIC_KEYS),), dtype=jnp.float32)
+            grad_norm = jnp.asarray(0.0, dtype=jnp.float32)
+            for i, batch_np in enumerate(batch_list):
+                batch_i = jax.device_put(batch_np)
+                grads, moving_sum, moving_weight, metrics_i, grad_norm_i = loss_grad_step(
+                    params,
+                    batch_i,
+                    moving_sum,
+                    moving_weight,
+                )
+                params, opt_state = muon_update_step(
+                    params,
+                    opt_state,
+                    grads,
+                    jnp.asarray(opt_steps[i], dtype=jnp.float32),
+                    jnp.asarray(lrs[i], dtype=jnp.float32),
+                    jnp.asarray(wds[i], dtype=jnp.float32),
+                )
+                metrics = metrics + metrics_i
+                grad_norm = grad_norm + grad_norm_i
+        else:
+            batch = jax.device_put(stack_batch_list(batch_list))
+            params, opt_state, moving_sum, moving_weight, metrics, grad_norm = train_steps(
+                params,
+                opt_state,
+                batch,
+                moving_sum,
+                moving_weight,
+                jnp.asarray(opt_steps),
+                jnp.asarray(lrs),
+                jnp.asarray(wds),
+            )
         if args.log_step_time:
             metrics.block_until_ready()
             train_wait_elapsed = time.perf_counter() - exec_start
