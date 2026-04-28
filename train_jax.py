@@ -164,6 +164,13 @@ def load_checkpoint(path):
         return pickle.load(f)
 
 
+def stack_batch_list(batch_list):
+    return {
+        key: np.stack([batch[key] for batch in batch_list], axis=0)
+        for key in batch_list[0]
+    }
+
+
 def main():
     global jax_losses, jax_model
 
@@ -180,6 +187,7 @@ def main():
     parser.add_argument("--max-training-samples", type=int, default=32768)
     parser.add_argument("--warmup-samples", type=int, default=4096)
     parser.add_argument("--print-every", type=int, default=20)
+    parser.add_argument("--steps-per-jit", type=int, default=1)
     parser.add_argument("--save-every-samples", type=int, default=0)
     parser.add_argument("--val-every-samples", type=int, default=0)
     parser.add_argument("--max-val-batches", type=int, default=16)
@@ -192,6 +200,8 @@ def main():
     parser.add_argument("--score-mode", type=str, default="simple", choices=["simple"])
     parser.add_argument("--xla-peak-tflops", type=float, default=918.0)
     args = parser.parse_args()
+    if args.steps_per_jit < 1:
+        raise ValueError("--steps-per-jit must be >= 1")
 
     try:
         import jax_losses as _jax_losses
@@ -282,8 +292,7 @@ def main():
             td_value_loss_scales=td_value_loss_scales,
         )
 
-    @jax.jit
-    def train_step(params_, opt_state_, batch_, moving_sum_, moving_weight_, opt_step, lr, wd):
+    def train_one_step(params_, opt_state_, batch_, moving_sum_, moving_weight_, opt_step, lr, wd):
         def scalar_loss(p):
             loss, metrics, new_moving_sum, new_moving_weight = loss_fn(
                 p, batch_, moving_sum_, moving_weight_, True
@@ -299,6 +308,37 @@ def main():
             grads = _tree_map(lambda g: g * scale, grads)
         new_params, new_opt_state = adamw_update(params_, grads, opt_state_, opt_step, lr, wd)
         return new_params, new_opt_state, new_moving_sum, new_moving_weight, metrics, grad_norm
+
+    @jax.jit
+    def train_steps(params_, opt_state_, batches_, moving_sum_, moving_weight_, opt_steps, lrs, wds):
+        def body(carry, xs):
+            params_i, opt_state_i, moving_sum_i, moving_weight_i = carry
+            batch_i, opt_step_i, lr_i, wd_i = xs
+            params_i, opt_state_i, moving_sum_i, moving_weight_i, metrics_i, grad_norm_i = train_one_step(
+                params_i,
+                opt_state_i,
+                batch_i,
+                moving_sum_i,
+                moving_weight_i,
+                opt_step_i,
+                lr_i,
+                wd_i,
+            )
+            return (params_i, opt_state_i, moving_sum_i, moving_weight_i), (metrics_i, grad_norm_i)
+
+        (params_, opt_state_, moving_sum_, moving_weight_), (metrics_seq, grad_norm_seq) = jax.lax.scan(
+            body,
+            (params_, opt_state_, moving_sum_, moving_weight_),
+            (batches_, opt_steps, lrs, wds),
+        )
+        return (
+            params_,
+            opt_state_,
+            moving_sum_,
+            moving_weight_,
+            jnp.sum(metrics_seq, axis=0),
+            jnp.sum(grad_norm_seq),
+        )
 
     @jax.jit
     def eval_step(params_, batch_, moving_sum_, moving_weight_):
@@ -325,6 +365,7 @@ def main():
     running_metrics = jnp.zeros((len(jax_losses.METRIC_KEYS),), dtype=jnp.float32)
     running_grad_norm = jnp.asarray(0.0, dtype=jnp.float32)
     last_print_time = time.perf_counter()
+    last_print_step = step
     save_every = args.save_every_samples or args.max_training_samples
     val_every = args.val_every_samples or args.max_training_samples
     last_save_samples = total_samples
@@ -387,10 +428,87 @@ def main():
         metrics_host = jax.device_get(val_metrics)
         log_metric_summary("  VAL", total_samples, metrics_host, val_count)
 
+    def run_training_chunk(batch_list):
+        nonlocal params, opt_state, moving_sum, moving_weight
+        nonlocal running_metrics, running_grad_norm, step, total_samples
+        batch_count = len(batch_list)
+        batch = jax.device_put(stack_batch_list(batch_list))
+        lr_wd = [lr_wd_at_step(step + i, args, samples_per_step) for i in range(batch_count)]
+        lrs = np.asarray([x[0] for x in lr_wd], dtype=np.float32)
+        wds = np.asarray([x[1] for x in lr_wd], dtype=np.float32)
+        opt_steps = np.arange(step + 1, step + batch_count + 1, dtype=np.float32)
+        params, opt_state, moving_sum, moving_weight, metrics, grad_norm = train_steps(
+            params,
+            opt_state,
+            batch,
+            moving_sum,
+            moving_weight,
+            jnp.asarray(opt_steps),
+            jnp.asarray(lrs),
+            jnp.asarray(wds),
+        )
+        running_metrics = running_metrics + metrics
+        running_grad_norm = running_grad_norm + grad_norm
+        step += batch_count
+        total_samples += args.batch_size * batch_count
+        return float(lrs[-1]), float(wds[-1]), batch_count
+
+    def after_training_chunk(lr, wd):
+        nonlocal running_metrics, running_grad_norm
+        nonlocal last_print_step, last_print_time, last_save_samples, last_val_samples
+
+        if step - last_print_step >= args.print_every:
+            metrics_host, grad_norm_host = jax.device_get((running_metrics, running_grad_norm))
+            elapsed = time.perf_counter() - last_print_time
+            batch_count = step - last_print_step
+            weight_sum = max(float(metrics_host[-1]), 1e-10)
+            sps = batch_count * args.batch_size / elapsed
+            tflops = sps * train_flops_per_sample / 1e12
+            mfu = tflops / args.xla_peak_tflops * 100.0 if args.xla_peak_tflops > 0 else 0.0
+            by_key = dict(zip(jax_losses.METRIC_KEYS, metrics_host.tolist()))
+            logging.info(
+                "step=%d, samples=%d, time=%.1fs, lr=%.2e, wd=%.4f, "
+                "loss=%.4f, p0loss=%.4f, vloss=%.4f, oloss=%.4f, skloss=%.4f, "
+                "pacc1=%.4f, grad_norm=%.3f, sps=%.1f, TFLOPS=%.2f, MFU=%.2f%%",
+                step,
+                total_samples,
+                elapsed,
+                lr,
+                wd,
+                by_key["loss"] / batch_count,
+                by_key["p0loss"] / weight_sum,
+                by_key["vloss"] / weight_sum,
+                by_key["oloss"] / weight_sum,
+                by_key["skloss"] / weight_sum,
+                by_key["pacc1"] / weight_sum,
+                float(grad_norm_host) / batch_count,
+                sps,
+                tflops,
+                mfu,
+            )
+            running_metrics = jnp.zeros_like(running_metrics)
+            running_grad_norm = jnp.asarray(0.0, dtype=jnp.float32)
+            last_print_step = step
+            last_print_time = time.perf_counter()
+
+        if total_samples - last_save_samples >= save_every:
+            save_start = time.perf_counter()
+            save_checkpoint(checkpoint_path, params, opt_state, checkpoint_meta())
+            logging.info("Saved checkpoint at step %d, %d samples", step, total_samples)
+            last_print_time += time.perf_counter() - save_start
+            last_save_samples = total_samples
+
+        if total_samples - last_val_samples >= val_every:
+            val_start = time.perf_counter()
+            run_validation()
+            last_print_time += time.perf_counter() - val_start
+            last_val_samples = total_samples
+
     while total_samples < args.max_training_samples:
         rand = np.random.default_rng(args.seed + step)
         shuffled = list(train_files)
         rand.shuffle(shuffled)
+        pending_batches = []
         for batch_np in jax_data.read_npz_batches(
             shuffled,
             args.batch_size,
@@ -403,68 +521,17 @@ def main():
         ):
             if total_samples >= args.max_training_samples:
                 break
-            batch = jax.device_put(batch_np)
-            lr, wd = lr_wd_at_step(step, args, samples_per_step)
-            params, opt_state, moving_sum, moving_weight, metrics, grad_norm = train_step(
-                params,
-                opt_state,
-                batch,
-                moving_sum,
-                moving_weight,
-                jnp.asarray(step + 1, dtype=jnp.float32),
-                jnp.asarray(lr, dtype=jnp.float32),
-                jnp.asarray(wd, dtype=jnp.float32),
-            )
-            running_metrics = running_metrics + metrics
-            running_grad_norm = running_grad_norm + grad_norm
-            step += 1
-            total_samples += args.batch_size
+            pending_batches.append(batch_np)
+            remaining_steps = (args.max_training_samples - total_samples) // args.batch_size
+            if len(pending_batches) < min(args.steps_per_jit, remaining_steps):
+                continue
+            lr, wd, _ = run_training_chunk(pending_batches)
+            pending_batches = []
+            after_training_chunk(lr, wd)
 
-            if step % args.print_every == 0:
-                metrics_host, grad_norm_host = jax.device_get((running_metrics, running_grad_norm))
-                elapsed = time.perf_counter() - last_print_time
-                batch_count = args.print_every
-                weight_sum = max(float(metrics_host[-1]), 1e-10)
-                sps = batch_count * args.batch_size / elapsed
-                tflops = sps * train_flops_per_sample / 1e12
-                mfu = tflops / args.xla_peak_tflops * 100.0 if args.xla_peak_tflops > 0 else 0.0
-                by_key = dict(zip(jax_losses.METRIC_KEYS, metrics_host.tolist()))
-                logging.info(
-                    "step=%d, samples=%d, time=%.1fs, lr=%.2e, wd=%.4f, "
-                    "loss=%.4f, p0loss=%.4f, vloss=%.4f, oloss=%.4f, skloss=%.4f, "
-                    "pacc1=%.4f, grad_norm=%.3f, sps=%.1f, TFLOPS=%.2f, MFU=%.2f%%",
-                    step,
-                    total_samples,
-                    elapsed,
-                    lr,
-                    wd,
-                    by_key["loss"] / batch_count,
-                    by_key["p0loss"] / weight_sum,
-                    by_key["vloss"] / weight_sum,
-                    by_key["oloss"] / weight_sum,
-                    by_key["skloss"] / weight_sum,
-                    by_key["pacc1"] / weight_sum,
-                    float(grad_norm_host) / batch_count,
-                    sps,
-                    tflops,
-                    mfu,
-                )
-                running_metrics = jnp.zeros_like(running_metrics)
-                running_grad_norm = jnp.asarray(0.0, dtype=jnp.float32)
-                last_print_time = time.perf_counter()
-
-            if total_samples - last_save_samples >= save_every:
-                save_start = time.perf_counter()
-                save_checkpoint(checkpoint_path, params, opt_state, checkpoint_meta())
-                logging.info("Saved checkpoint at step %d, %d samples", step, total_samples)
-                last_print_time += time.perf_counter() - save_start
-                last_save_samples = total_samples
-
-            if total_samples - last_val_samples >= val_every:
-                val_start = time.perf_counter()
-                run_validation()
-                last_print_time += time.perf_counter() - val_start
-                last_val_samples = total_samples
+        if pending_batches and total_samples < args.max_training_samples:
+            lr, wd, _ = run_training_chunk(pending_batches)
+            after_training_chunk(lr, wd)
 
         if not shuffled:
             break

@@ -50,6 +50,7 @@ python -u train_jax.py \
     --max-training-samples "${MAX_TRAINING_SAMPLES_VALUE}" \
     --warmup-samples "${WARMUP_SAMPLES_VALUE}" \
     --print-every "${PRINT_EVERY:-20}" \
+    --steps-per-jit "${STEPS_PER_JIT:-1}" \
     --save-every-samples "${SAVE_EVERY_SAMPLES_VALUE}" \
     --val-every-samples "${VAL_EVERY_SAMPLES_VALUE}" \
     --max-val-batches "${MAX_VAL_BATCHES:-16}" \

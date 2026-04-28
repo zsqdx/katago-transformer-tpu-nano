@@ -445,6 +445,20 @@ Judge the run by stable post-compile windows. If JAX removes the repeated
 compile and host-transfer stalls, the next useful step is making it the main
 TPU path and filling in the remaining feature gaps.
 
+For deeper/narrower shapes like `b24c1024`, the per-step dispatch overhead is a
+larger fraction of runtime than it is for `b12c2048`. Use `STEPS_PER_JIT=4`
+first, then try `8` if HBM is comfortable:
+
+```bash
+MODEL_KIND=b24c1024 \
+BATCH_SIZE=16 \
+STEPS_PER_JIT=4 \
+MAX_TRAINING_SAMPLES=32768 \
+WARMUP_SAMPLES=4096 \
+TRAINDIR=./jax_tpu_run_b24c1024_b16_s4 \
+bash train_jax.sh
+```
+
 For reference, the command expanded by `train.sh` is equivalent to:
 
 ```bash

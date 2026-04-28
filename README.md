@@ -122,6 +122,10 @@ If the stable windows after the first compile land far above the PyTorch/XLA
 run, the next migration step is making the JAX path the default TPU runner and
 then filling in the remaining feature gaps.
 
+For deeper/narrower presets such as `b24c1024`, try `STEPS_PER_JIT=4` or `8`
+to execute several optimizer steps per XLA call. This reduces per-step dispatch
+overhead without changing the per-sample LR schedule or checkpoint semantics.
+
 ## CUDA Training Example
 
 ```bash
