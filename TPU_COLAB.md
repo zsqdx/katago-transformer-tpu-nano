@@ -500,6 +500,11 @@ For the widest `c2048` shapes, also try `ROPE_DTYPE=bf16`,
 `FFN_MUL_DTYPE=bf16`, and `ATTENTION_LOGITS_DTYPE=bf16`. These reduce fp32
 elementwise work in RoPE, SwiGLU, and manual-attention logits, respectively,
 so compare both speed and loss behavior.
+The current best single-chip TPU v6e profile from short sweeps is packaged as
+`bash train_jax_best_tpu.sh`: `b24c2048`, `BATCH_SIZE=24`, full BF16
+storage/activations, BF16 RoPE/SwiGLU/attention logits, and train-buffer
+donation. It is the recommended speed baseline, while longer runs should still
+validate training quality.
 Set `OPTIMIZER=none` or `OPTIMIZER=sgd` only for profiling optimizer overhead:
 `none` skips parameter updates and may let XLA eliminate unused backward work,
 so treat it as a forward/loss lower-bound probe; `sgd` keeps gradients live
@@ -535,7 +540,7 @@ fast and disk-light.
 Set `SWEEP_FAST_BF16=1` to apply the current fast TPU profile while sweeping:
 BF16 RoPE, BF16 SwiGLU multiply, BF16 attention logits, and train-buffer
 donation. For batch-size search, run `bash sweep_jax_batches.sh`; override with
-`MODEL_KIND=b24c2048` and `BATCH_SIZES="8 12 16 20 24 32"`.
+`MODEL_KIND=b24c2048` and `BATCH_SIZES="16 20 22 24 26 28 32"`.
 
 The default sweep includes the intermediate `c2048` depth probes from
 `b10c2048` through `b22c2048` so you can see where the single-chip sweet spot

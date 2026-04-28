@@ -169,6 +169,11 @@ More granular BF16 probes are available for the current TPU bottlenecks:
 the SwiGLU gate product in BF16, and `ATTENTION_LOGITS_DTYPE=bf16` runs the
 manual-attention softmax logits in BF16. These are profiling switches because
 they can affect numerical behavior.
+The current best single-chip TPU v6e profile from short sweeps is available as
+`bash train_jax_best_tpu.sh`: `b24c2048`, `BATCH_SIZE=24`, full BF16
+storage/activations, BF16 RoPE/SwiGLU/attention logits, and train-buffer
+donation. In short-window sweeps it reached about 43.5% MFU, but longer runs
+should still validate training quality.
 Set `OPTIMIZER=none` or `OPTIMIZER=sgd` only for profiling optimizer overhead:
 `none` skips parameter updates and may let XLA eliminate unused backward work,
 so treat it as a forward/loss lower-bound probe; `sgd` keeps gradients live
@@ -206,7 +211,7 @@ Set `SWEEP_FAST_BF16=1` to sweep with the current fast TPU profile
 (`ROPE_DTYPE=bf16`, `FFN_MUL_DTYPE=bf16`, `ATTENTION_LOGITS_DTYPE=bf16`, and
 `DONATE_TRAIN_BUFFERS=1`). To sweep batch size around one model, run
 `bash sweep_jax_batches.sh`; override with `MODEL_KIND=b24c2048` and
-`BATCH_SIZES="8 12 16 20 24 32"`.
+`BATCH_SIZES="16 20 22 24 26 28 32"`.
 
 ## CUDA Training Example
 

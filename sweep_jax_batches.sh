@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 MODEL_KIND_VALUE="${MODEL_KIND:-b24c2048}"
-BATCH_SIZES_VALUE="${BATCH_SIZES:-8 12 16 20 24 32}"
+BATCH_SIZES_VALUE="${BATCH_SIZES:-16 20 22 24 26 28 32}"
 
 specs=""
 for batch in ${BATCH_SIZES_VALUE}; do
