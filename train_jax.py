@@ -190,7 +190,7 @@ def _is_muon_path(path, leaf):
 
 
 def _is_qkv_projection_path(path):
-    return any(part in ("q_proj", "k_proj", "v_proj") for part in path)
+    return any(part in ("q_proj", "k_proj", "v_proj", "qkv_proj") for part in path)
 
 
 def init_muon_adamw_state(params, dtype=None):
@@ -211,13 +211,16 @@ def init_muon_adamw_state(params, dtype=None):
     }
 
 
-def _muon_split_for_path(path, tensor, num_heads):
+def _muon_split_for_path(path, tensor, num_heads, row_split_size=0):
     if tensor.ndim == 4:
         tensor = tensor.reshape((tensor.shape[0], -1))
     if _is_qkv_projection_path(path) and num_heads > 0:
-        if tensor.shape[-2] % num_heads != 0:
+        chunks = 3 * num_heads if any(part == "qkv_proj" for part in path) else num_heads
+        if tensor.shape[-2] % chunks != 0:
             raise ValueError(f"Cannot head-split Muon param {'/'.join(path)} with shape {tensor.shape}")
-        return tensor.reshape((-1, tensor.shape[-2] // num_heads, tensor.shape[-1]))
+        return tensor.reshape((-1, tensor.shape[-2] // chunks, tensor.shape[-1]))
+    if row_split_size > 0 and tensor.shape[-2] > row_split_size and tensor.shape[-2] % row_split_size == 0:
+        return tensor.reshape((-1, row_split_size, tensor.shape[-1]))
     return tensor
 
 
@@ -303,6 +306,7 @@ def muon_adamw_update(
     eps=1e-8,
     muon_lr_multiplier=0.2,
     muon_momentum=0.95,
+    muon_row_split_size=0,
 ):
     import jax.numpy as jnp
 
@@ -334,7 +338,7 @@ def muon_adamw_update(
 
     def muon_update_leaf(path, p, g, m, v):
         new_m_leaf = muon_momentum_v * m.astype(update_dtype) + g.astype(update_dtype)
-        split_update = _muon_split_for_path(path, new_m_leaf, num_heads)
+        split_update = _muon_split_for_path(path, new_m_leaf, num_heads, muon_row_split_size)
         split_update = polar_express_jax(split_update)
         scale = math.sqrt(max(split_update.shape[-2], split_update.shape[-1]))
         update = (split_update * jnp.asarray(scale, dtype=split_update.dtype)).reshape(p.shape)
@@ -485,6 +489,38 @@ def estimate_forward_component_flops(config, pos_len, score_mode="simple"):
     }
 
 
+def estimate_muon_update_flops(config, row_split_size=0, fuse_projections=False):
+    d = config["hidden_size"]
+    heads = config["num_heads"]
+    ff = config["ffn_dim"]
+    layers = config["num_layers"]
+
+    def polar_flops(m, n):
+        if m > n:
+            m, n = n, m
+        return 5 * (4 * m * m * n + 2 * m * m * m)
+
+    def split_flops(m, n):
+        if row_split_size > 0 and m > row_split_size and m % row_split_size == 0:
+            return (m // row_split_size) * polar_flops(row_split_size, n)
+        return polar_flops(m, n)
+
+    head_dim = d // heads
+    if fuse_projections:
+        qkv = 3 * heads * polar_flops(head_dim, d)
+        per_layer = qkv + split_flops(d, d) + split_flops(2 * ff, d) + split_flops(d, ff)
+    else:
+        qkv = 3 * heads * polar_flops(head_dim, d)
+        per_layer = (
+            qkv
+            + split_flops(d, d)
+            + split_flops(ff, d)
+            + split_flops(ff, d)
+            + split_flops(d, ff)
+        )
+    return layers * per_layer
+
+
 def lr_wd_at_step(step, args, samples_per_step):
     if args.lr_schedule == "constant":
         return args.lr, args.wd
@@ -539,6 +575,7 @@ def main():
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon", "sgd", "none"])
     parser.add_argument("--muon-lr-multiplier", type=float, default=0.2)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
+    parser.add_argument("--muon-row-split-size", type=int, default=0)
     parser.add_argument("--loss-profile", type=str, default="full",
                         choices=["full", "policy_value", "policy_only", "value_only"])
     parser.add_argument("--grad-clip-norm", type=float, default=0.0)
@@ -590,6 +627,8 @@ def main():
         raise ValueError("--steps-per-jit must be >= 1")
     if args.component_profile_repeats < 1:
         raise ValueError("--component-profile-repeats must be >= 1")
+    if args.muon_row_split_size < 0:
+        raise ValueError("--muon-row-split-size must be >= 0")
     track_grad_norm = args.log_grad_norm or args.grad_clip_norm > 0
 
     try:
@@ -753,6 +792,7 @@ def main():
                 update_dtype=opt_update_dtype,
                 muon_lr_multiplier=args.muon_lr_multiplier,
                 muon_momentum=args.muon_momentum,
+                muon_row_split_size=args.muon_row_split_size,
             )
         elif args.optimizer == "sgd":
             new_params = sgd_update(
@@ -839,6 +879,7 @@ def main():
             update_dtype=opt_update_dtype,
             muon_lr_multiplier=args.muon_lr_multiplier,
             muon_momentum=args.muon_momentum,
+            muon_row_split_size=args.muon_row_split_size,
         )
 
     muon_update_donate_argnums = (0, 1) if args.donate_train_buffers else ()
@@ -865,6 +906,18 @@ def main():
         forward_flops / 1e9,
         train_flops_per_sample / 1e9,
     )
+    if args.optimizer == "muon":
+        muon_update_flops = estimate_muon_update_flops(
+            model_config,
+            row_split_size=args.muon_row_split_size,
+            fuse_projections=args.fuse_projections and not args.separate_projections,
+        )
+        logging.info(
+            "Muon update approx FLOPs/step=%.2fT (row_split=%d). "
+            "The standard TFLOPS/MFU logs count model train FLOPs only.",
+            muon_update_flops / 1e12,
+            args.muon_row_split_size,
+        )
     component_flops = estimate_forward_component_flops(model_config, args.pos_len, args.score_mode)
 
     def block_until_ready(value):
@@ -1192,6 +1245,7 @@ def main():
                     update_dtype=opt_update_dtype,
                     muon_lr_multiplier=args.muon_lr_multiplier,
                     muon_momentum=args.muon_momentum,
+                    muon_row_split_size=args.muon_row_split_size,
                 )[0],
                 params,
                 grads,
@@ -1258,6 +1312,7 @@ def main():
             "optimizer": args.optimizer,
             "muon_lr_multiplier": args.muon_lr_multiplier,
             "muon_momentum": args.muon_momentum,
+            "muon_row_split_size": args.muon_row_split_size,
             "loss_profile": args.loss_profile,
             "log_step_time": args.log_step_time,
             "moving_sum": float(jax.device_get(moving_sum)),

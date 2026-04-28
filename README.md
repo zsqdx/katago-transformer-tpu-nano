@@ -179,6 +179,10 @@ matrix weights use Muon, while stem/head/norm parameters continue to use AdamW.
 The defaults match the PyTorch path (`MUON_LR_MULTIPLIER=0.2`,
 `MUON_MOMENTUM=0.95`). Use `NO_RESUME=1` when switching an existing JAX run
 between AdamW and Muon because the optimizer state layout differs.
+Muon's optimizer work is not included in the standard model-FLOPs MFU log, and
+full-matrix Muon on wide FFN weights can dominate wall time. Set
+`MUON_ROW_SPLIT_SIZE=256` to split large block matrices into row chunks before
+the polar iteration; try `128`, `256`, and `512` as TPU throughput/quality A/Bs.
 Set `OPTIMIZER=none` or `OPTIMIZER=sgd` only for profiling optimizer overhead:
 `none` skips parameter updates and may let XLA eliminate unused backward work,
 so treat it as a forward/loss lower-bound probe; `sgd` keeps gradients live
