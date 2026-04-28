@@ -43,6 +43,12 @@ fi
 if [ "${LOG_STEP_TIME:-0}" != "0" ]; then
     EXTRA_FLAGS+=(--log-step-time)
 fi
+if [ "${COMPONENT_PROFILE:-0}" != "0" ]; then
+    EXTRA_FLAGS+=(--component-profile)
+fi
+if [ "${COMPONENT_PROFILE_GRAD:-0}" != "0" ]; then
+    EXTRA_FLAGS+=(--component-profile-grad)
+fi
 if [ "${DONATE_TRAIN_BUFFERS:-0}" != "0" ]; then
     EXTRA_FLAGS+=(--donate-train-buffers)
 fi
@@ -77,6 +83,7 @@ python -u train_jax.py \
     --warmup-samples "${WARMUP_SAMPLES_VALUE}" \
     --print-every "${PRINT_EVERY:-20}" \
     --steps-per-jit "${STEPS_PER_JIT:-1}" \
+    --component-profile-repeats "${COMPONENT_PROFILE_REPEATS:-3}" \
     --save-every-samples "${SAVE_EVERY_SAMPLES_VALUE}" \
     --val-every-samples "${VAL_EVERY_SAMPLES_VALUE}" \
     --max-val-batches "${MAX_VAL_BATCHES:-16}" \

@@ -193,6 +193,41 @@ def estimate_forward_flops(config, pos_len, score_mode="simple"):
     return trunk + conv + global_flops + policy + value + score
 
 
+def estimate_forward_component_flops(config, pos_len, score_mode="simple"):
+    s = pos_len * pos_len
+    d = config["hidden_size"]
+    ff = config["ffn_dim"]
+    blocks = config["num_layers"]
+    attn_qkv = 3 * 2 * s * d * d
+    attn_scores = 2 * s * s * d
+    attn_values = 2 * s * s * d
+    attn_out_proj = 2 * s * d * d
+    ffn_upgate = 2 * 2 * s * d * ff
+    ffn_down = 2 * s * ff * d
+    block = attn_qkv + attn_scores + attn_values + attn_out_proj + ffn_upgate + ffn_down
+    conv = 2 * configs.get_num_bin_input_features(config) * d * 9 * s
+    global_flops = 2 * configs.get_num_global_input_features(config) * d
+    policy = 2 * s * d * 6 + 2 * d * 6
+    value = 2 * s * d * 29
+    score_len = (s + 60) * 2
+    score = 2 * d * score_len
+    if score_mode != "simple":
+        score = 2 * d * (score_len * config["num_scorebeliefs"] + config["num_scorebeliefs"])
+    heads = policy + value + score
+    return {
+        "stem_fwd": conv + global_flops,
+        "block0_qkv_proj": attn_qkv,
+        "block0_attention_core": attn_scores + attn_values,
+        "block0_out_proj_residual": attn_out_proj,
+        "block0_ffn_upgate": ffn_upgate,
+        "block0_ffn_down_residual": ffn_down,
+        "block0_total_fwd": block,
+        "trunk_all_blocks_fwd": block * blocks,
+        "heads_fwd": heads,
+        "full_forward": block * blocks + conv + global_flops + heads,
+    }
+
+
 def lr_wd_at_step(step, args, samples_per_step):
     if args.lr_schedule == "constant":
         return args.lr, args.wd
@@ -273,6 +308,9 @@ def main():
                         choices=["float32", "fp32", "bfloat16", "bf16"])
     parser.add_argument("--log-grad-norm", action="store_true")
     parser.add_argument("--log-step-time", action="store_true")
+    parser.add_argument("--component-profile", action="store_true")
+    parser.add_argument("--component-profile-repeats", type=int, default=3)
+    parser.add_argument("--component-profile-grad", action="store_true")
     parser.add_argument("--donate-train-buffers", action="store_true")
     parser.add_argument("--stack-blocks", action="store_true")
     parser.add_argument("--scan-blocks", action="store_true")
@@ -284,6 +322,8 @@ def main():
     args = parser.parse_args()
     if args.steps_per_jit < 1:
         raise ValueError("--steps-per-jit must be >= 1")
+    if args.component_profile_repeats < 1:
+        raise ValueError("--component-profile-repeats must be >= 1")
     track_grad_norm = args.log_grad_norm or args.grad_clip_norm > 0
 
     try:
@@ -495,6 +535,349 @@ def main():
         forward_flops / 1e9,
         train_flops_per_sample / 1e9,
     )
+    component_flops = estimate_forward_component_flops(model_config, args.pos_len, args.score_mode)
+
+    def block_until_ready(value):
+        return jax.block_until_ready(value)
+
+    def first_transformer_block(params_):
+        blocks = params_["blocks"]
+        if isinstance(blocks, dict):
+            return jax_model.tree_index(blocks, 0)
+        return blocks[0]
+
+    def run_component_profile():
+        logging.info(
+            "COMPONENT_PROFILE starting: repeats=%d grad=%s. "
+            "These are separately-jitted microbenchmarks, so use them for bottleneck direction; "
+            "XLA may fuse/schedule ops differently inside the full train step.",
+            args.component_profile_repeats,
+            args.component_profile_grad,
+        )
+        profile_batches = jax_data.read_npz_batches(
+            train_files,
+            args.batch_size,
+            args.pos_len,
+            model_config,
+            symmetry_type=args.symmetry_type,
+            enable_history_matrices=args.enable_history_matrices,
+            seed=args.seed + 424242,
+            allow_nonfull_mask=args.allow_nonfull_mask,
+        )
+        try:
+            batch = jax.device_put(next(profile_batches))
+        except StopIteration:
+            logging.warning("COMPONENT_PROFILE skipped: no full training batch available")
+            return
+
+        rope_cos, rope_sin = rope_cache
+        num_heads = model_config["num_heads"]
+
+        def time_component(name, fn, *fn_args, flops_per_sample=0.0):
+            compiled = jax.jit(fn)
+            compile_start = time.perf_counter()
+            result = block_until_ready(compiled(*fn_args))
+            compile_first = time.perf_counter() - compile_start
+
+            times = []
+            for _ in range(args.component_profile_repeats):
+                run_start = time.perf_counter()
+                result = block_until_ready(compiled(*fn_args))
+                times.append(time.perf_counter() - run_start)
+            times_np = np.asarray(times, dtype=np.float64)
+            mean_elapsed = float(times_np.mean())
+            min_elapsed = float(times_np.min())
+            max_elapsed = float(times_np.max())
+
+            if flops_per_sample > 0 and min_elapsed > 0:
+                best_tflops = args.batch_size * flops_per_sample / min_elapsed / 1e12
+                best_mfu = best_tflops / args.xla_peak_tflops * 100.0 if args.xla_peak_tflops > 0 else 0.0
+                perf_text = f" est_TFLOPS_min={best_tflops:.2f} est_MFU_min={best_mfu:.2f}%"
+            else:
+                perf_text = ""
+            logging.info(
+                "COMPONENT_TIME name=%s compile_first=%.4fs mean=%.6fs min=%.6fs max=%.6fs repeats=%d%s",
+                name,
+                compile_first,
+                mean_elapsed,
+                min_elapsed,
+                max_elapsed,
+                args.component_profile_repeats,
+                perf_text,
+            )
+            return result
+
+        def stem_fn(params_i, batch_i):
+            return jax_model.forward_stem(
+                params_i,
+                batch_i["binaryInputNCHW"],
+                batch_i["globalInputNC"],
+                model_config,
+                args.pos_len,
+                activation_dtype,
+            )
+
+        x_stem = time_component(
+            "stem_fwd",
+            stem_fn,
+            params,
+            batch,
+            flops_per_sample=component_flops["stem_fwd"],
+        )
+        block0 = first_transformer_block(params)
+
+        x_norm1 = time_component(
+            "block0_norm1",
+            lambda block_i, x_i: jax_model.rms_norm(block_i["norm1"], x_i),
+            block0,
+            x_stem,
+        )
+
+        def qkv_fn(block_i, x_norm_i):
+            bsz, seq_len, channels = x_norm_i.shape
+            head_dim = channels // num_heads
+            if "qkv_proj" in block_i:
+                qkv = jax_model.linear(block_i["qkv_proj"], x_norm_i, out_dtype=activation_dtype)
+                q, k, v = jnp.split(qkv, 3, axis=-1)
+            else:
+                q = jax_model.linear(block_i["q_proj"], x_norm_i, out_dtype=activation_dtype)
+                k = jax_model.linear(block_i["k_proj"], x_norm_i, out_dtype=activation_dtype)
+                v = jax_model.linear(block_i["v_proj"], x_norm_i, out_dtype=activation_dtype)
+            return (
+                q.reshape(bsz, seq_len, num_heads, head_dim),
+                k.reshape(bsz, seq_len, num_heads, head_dim),
+                v.reshape(bsz, seq_len, num_heads, head_dim),
+            )
+
+        q, k, v = time_component(
+            "block0_qkv_proj",
+            qkv_fn,
+            block0,
+            x_norm1,
+            flops_per_sample=component_flops["block0_qkv_proj"],
+        )
+        q, k = time_component(
+            "block0_rope",
+            lambda q_i, k_i: jax_model.apply_rope(q_i, k_i, rope_cos, rope_sin),
+            q,
+            k,
+        )
+
+        def attention_core_fn(q_i, k_i, v_i):
+            bsz, seq_len, heads, head_dim = q_i.shape
+            return jax_model.attention(
+                q_i,
+                k_i,
+                v_i,
+                attention_impl=args.attention_impl,
+                out_dtype=activation_dtype,
+            ).reshape(bsz, seq_len, heads * head_dim)
+
+        attn_out = time_component(
+            "block0_attention_core",
+            attention_core_fn,
+            q,
+            k,
+            v,
+            flops_per_sample=component_flops["block0_attention_core"],
+        )
+        x_attn = time_component(
+            "block0_out_proj_residual",
+            lambda block_i, x_i, attn_i: (
+                x_i + jax_model.linear(block_i["out_proj"], attn_i, out_dtype=activation_dtype)
+            ).astype(activation_dtype),
+            block0,
+            x_stem,
+            attn_out,
+            flops_per_sample=component_flops["block0_out_proj_residual"],
+        )
+        x_norm2 = time_component(
+            "block0_norm2",
+            lambda block_i, x_i: jax_model.rms_norm(block_i["norm2"], x_i),
+            block0,
+            x_attn,
+        )
+
+        def ffn_upgate_fn(block_i, x_norm_i):
+            if "ffn_upgate" in block_i:
+                upgate = jax_model.linear(block_i["ffn_upgate"], x_norm_i, out_dtype=activation_dtype)
+                w1, wg = jnp.split(upgate, 2, axis=-1)
+                w1 = jax_model.silu(w1)
+            else:
+                w1 = jax_model.silu(jax_model.linear(block_i["ffn_w1"], x_norm_i, out_dtype=activation_dtype))
+                wg = jax_model.linear(block_i["ffn_wgate"], x_norm_i, out_dtype=activation_dtype)
+            return (w1.astype(jnp.float32) * wg.astype(jnp.float32)).astype(activation_dtype)
+
+        hidden = time_component(
+            "block0_ffn_upgate",
+            ffn_upgate_fn,
+            block0,
+            x_norm2,
+            flops_per_sample=component_flops["block0_ffn_upgate"],
+        )
+        _ = time_component(
+            "block0_ffn_down_residual",
+            lambda block_i, x_i, hidden_i: (
+                x_i + jax_model.linear(block_i["ffn_w2"], hidden_i, out_dtype=activation_dtype)
+            ).astype(activation_dtype),
+            block0,
+            x_attn,
+            hidden,
+            flops_per_sample=component_flops["block0_ffn_down_residual"],
+        )
+        _ = time_component(
+            "block0_total_fwd",
+            lambda block_i, x_i: jax_model.transformer_block(
+                block_i,
+                x_i,
+                rope_cos,
+                rope_sin,
+                num_heads,
+                attention_impl=args.attention_impl,
+                activation_dtype=activation_dtype,
+            ),
+            block0,
+            x_stem,
+            flops_per_sample=component_flops["block0_total_fwd"],
+        )
+        x_trunk = time_component(
+            "trunk_all_blocks_fwd",
+            lambda params_i, x_i: jax_model.forward_trunk(
+                params_i,
+                x_i,
+                model_config,
+                rope_cache,
+                attention_impl=args.attention_impl,
+                activation_dtype=activation_dtype,
+                remat_blocks=args.remat_blocks,
+                scan_blocks=args.scan_blocks,
+            ),
+            params,
+            x_stem,
+            flops_per_sample=component_flops["trunk_all_blocks_fwd"],
+        )
+        _ = time_component(
+            "heads_fwd",
+            lambda params_i, x_i: jax_model.forward_heads(params_i, x_i, args.pos_len),
+            params,
+            x_trunk,
+            flops_per_sample=component_flops["heads_fwd"],
+        )
+        _ = time_component(
+            "full_forward",
+            lambda params_i, batch_i: jax_model.forward(
+                params_i,
+                batch_i["binaryInputNCHW"],
+                batch_i["globalInputNC"],
+                model_config,
+                args.pos_len,
+                rope_cache,
+                attention_impl=args.attention_impl,
+                activation_dtype=activation_dtype,
+                remat_blocks=args.remat_blocks,
+                scan_blocks=args.scan_blocks,
+            ),
+            params,
+            batch,
+            flops_per_sample=component_flops["full_forward"],
+        )
+        _ = time_component(
+            "loss_forward",
+            lambda params_i, batch_i, moving_sum_i, moving_weight_i: loss_fn(
+                params_i,
+                batch_i,
+                moving_sum_i,
+                moving_weight_i,
+                True,
+            )[0],
+            params,
+            batch,
+            moving_sum,
+            moving_weight,
+            flops_per_sample=component_flops["full_forward"],
+        )
+
+        if not args.component_profile_grad:
+            logging.info("COMPONENT_PROFILE grad/update skipped; set COMPONENT_PROFILE_GRAD=1 to include them")
+            logging.info("COMPONENT_PROFILE complete")
+            return
+
+        def loss_grad_fn(params_i, batch_i, moving_sum_i, moving_weight_i):
+            def scalar_loss(p):
+                return loss_fn(p, batch_i, moving_sum_i, moving_weight_i, True)[0]
+
+            return jax.value_and_grad(scalar_loss)(params_i)
+
+        loss_value, grads = time_component(
+            "loss_grad",
+            loss_grad_fn,
+            params,
+            batch,
+            moving_sum,
+            moving_weight,
+            flops_per_sample=train_flops_per_sample,
+        )
+        del loss_value
+        if args.optimizer == "adamw":
+            _ = time_component(
+                "optimizer_adamw_update",
+                lambda params_i, grads_i, opt_state_i: adamw_update(
+                    params_i,
+                    grads_i,
+                    opt_state_i,
+                    jnp.asarray(1.0, dtype=jnp.float32),
+                    jnp.asarray(args.lr, dtype=jnp.float32),
+                    jnp.asarray(args.wd, dtype=jnp.float32),
+                    state_dtype=opt_state_dtype,
+                    param_dtype=param_dtype,
+                    update_dtype=opt_update_dtype,
+                )[0],
+                params,
+                grads,
+                opt_state,
+            )
+        elif args.optimizer == "sgd":
+            _ = time_component(
+                "optimizer_sgd_update",
+                lambda params_i, grads_i: sgd_update(
+                    params_i,
+                    grads_i,
+                    jnp.asarray(args.lr, dtype=jnp.float32),
+                    jnp.asarray(args.wd, dtype=jnp.float32),
+                    param_dtype=param_dtype,
+                    update_dtype=opt_update_dtype,
+                ),
+                params,
+                grads,
+            )
+        else:
+            logging.info("COMPONENT_PROFILE optimizer update skipped for optimizer=%s", args.optimizer)
+
+        _ = time_component(
+            "train_one_step_full",
+            lambda params_i, opt_state_i, batch_i, moving_sum_i, moving_weight_i: train_one_step(
+                params_i,
+                opt_state_i,
+                batch_i,
+                moving_sum_i,
+                moving_weight_i,
+                jnp.asarray(1.0, dtype=jnp.float32),
+                jnp.asarray(args.lr, dtype=jnp.float32),
+                jnp.asarray(args.wd, dtype=jnp.float32),
+            ),
+            params,
+            opt_state,
+            batch,
+            moving_sum,
+            moving_weight,
+            flops_per_sample=train_flops_per_sample,
+        )
+        logging.info("COMPONENT_PROFILE complete")
+
+    if args.component_profile:
+        profile_start = time.perf_counter()
+        run_component_profile()
+        logging.info("COMPONENT_PROFILE total_time=%.1fs", time.perf_counter() - profile_start)
 
     running_metrics = jnp.zeros((len(jax_losses.METRIC_KEYS),), dtype=jnp.float32)
     running_grad_norm = jnp.asarray(0.0, dtype=jnp.float32)

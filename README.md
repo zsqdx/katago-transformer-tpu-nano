@@ -145,6 +145,15 @@ Set `LOG_STEP_TIME=1` to synchronously log every compiled train call. With the
 default `STEPS_PER_JIT=1`, each `STEP_TIME` line is one optimizer step; with
 larger chunks, `per_step_total` is the chunk average. This mode is for timing
 debugging and intentionally adds synchronization.
+Set `COMPONENT_PROFILE=1` to run one separately-jitted component microprofile
+before training starts. It prints `COMPONENT_TIME` rows for `stem_fwd`,
+`block0_qkv_proj`, `block0_attention_core`, `block0_ffn_upgate`,
+`trunk_all_blocks_fwd`, `heads_fwd`, `full_forward`, and `loss_forward`.
+Use `COMPONENT_PROFILE_REPEATS=5` to change the stable timing repeats, and
+`COMPONENT_PROFILE_GRAD=1` to include the much heavier `loss_grad`,
+optimizer-update, and full train-step probes. These component timings are
+directional because XLA can fuse and schedule operations differently inside
+the real training step.
 
 Mixed-precision A/B switches are also available for TPU profiling:
 `ACTIVATION_DTYPE=bf16` keeps trunk activations in BF16 between transformer

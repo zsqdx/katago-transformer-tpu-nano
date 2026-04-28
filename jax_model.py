@@ -230,60 +230,77 @@ def transformer_block(
     bsz, seq_len, channels = x.shape
     head_dim = channels // num_heads
 
-    x_norm = rms_norm(params["norm1"], x)
-    if "qkv_proj" in params:
-        qkv = linear(params["qkv_proj"], x_norm, out_dtype=activation_dtype)
-        q, k, v = jnp.split(qkv, 3, axis=-1)
-    else:
-        q = linear(params["q_proj"], x_norm, out_dtype=activation_dtype)
-        k = linear(params["k_proj"], x_norm, out_dtype=activation_dtype)
-        v = linear(params["v_proj"], x_norm, out_dtype=activation_dtype)
-    q = q.reshape(bsz, seq_len, num_heads, head_dim)
-    k = k.reshape(bsz, seq_len, num_heads, head_dim)
-    v = v.reshape(bsz, seq_len, num_heads, head_dim)
-    q, k = apply_rope(q, k, rope_cos, rope_sin)
-    attn_out = attention(
-        q,
-        k,
-        v,
-        attention_impl=attention_impl,
-        out_dtype=activation_dtype,
-    ).reshape(bsz, seq_len, channels)
-    x = (x + linear(params["out_proj"], attn_out, out_dtype=activation_dtype)).astype(activation_dtype)
+    with jax.named_scope("attn_norm"):
+        x_norm = rms_norm(params["norm1"], x)
+    with jax.named_scope("attn_qkv"):
+        if "qkv_proj" in params:
+            qkv = linear(params["qkv_proj"], x_norm, out_dtype=activation_dtype)
+            q, k, v = jnp.split(qkv, 3, axis=-1)
+        else:
+            q = linear(params["q_proj"], x_norm, out_dtype=activation_dtype)
+            k = linear(params["k_proj"], x_norm, out_dtype=activation_dtype)
+            v = linear(params["v_proj"], x_norm, out_dtype=activation_dtype)
+        q = q.reshape(bsz, seq_len, num_heads, head_dim)
+        k = k.reshape(bsz, seq_len, num_heads, head_dim)
+        v = v.reshape(bsz, seq_len, num_heads, head_dim)
+    with jax.named_scope("attn_rope"):
+        q, k = apply_rope(q, k, rope_cos, rope_sin)
+    with jax.named_scope("attention"):
+        attn_out = attention(
+            q,
+            k,
+            v,
+            attention_impl=attention_impl,
+            out_dtype=activation_dtype,
+        ).reshape(bsz, seq_len, channels)
+    with jax.named_scope("attn_out_proj"):
+        x = (x + linear(params["out_proj"], attn_out, out_dtype=activation_dtype)).astype(activation_dtype)
 
-    x_norm = rms_norm(params["norm2"], x)
-    if "ffn_upgate" in params:
-        upgate = linear(params["ffn_upgate"], x_norm, out_dtype=activation_dtype)
-        w1, wg = jnp.split(upgate, 2, axis=-1)
-        w1 = silu(w1)
-    else:
-        w1 = silu(linear(params["ffn_w1"], x_norm, out_dtype=activation_dtype))
-        wg = linear(params["ffn_wgate"], x_norm, out_dtype=activation_dtype)
-    hidden = (w1.astype(jnp.float32) * wg.astype(jnp.float32)).astype(activation_dtype)
-    return (x + linear(params["ffn_w2"], hidden, out_dtype=activation_dtype)).astype(activation_dtype)
+    with jax.named_scope("ffn_norm"):
+        x_norm = rms_norm(params["norm2"], x)
+    with jax.named_scope("ffn_upgate"):
+        if "ffn_upgate" in params:
+            upgate = linear(params["ffn_upgate"], x_norm, out_dtype=activation_dtype)
+            w1, wg = jnp.split(upgate, 2, axis=-1)
+            w1 = silu(w1)
+        else:
+            w1 = silu(linear(params["ffn_w1"], x_norm, out_dtype=activation_dtype))
+            wg = linear(params["ffn_wgate"], x_norm, out_dtype=activation_dtype)
+        hidden = (w1.astype(jnp.float32) * wg.astype(jnp.float32)).astype(activation_dtype)
+    with jax.named_scope("ffn_down"):
+        return (x + linear(params["ffn_w2"], hidden, out_dtype=activation_dtype)).astype(activation_dtype)
 
 
-def forward(
+def forward_stem(
     params,
     binary_input,
     global_input,
     config,
     pos_len,
+    activation_dtype=jnp.float32,
+):
+    c = config["hidden_size"]
+    n = binary_input.shape[0]
+    seq_len = pos_len * pos_len
+
+    with jax.named_scope("stem"):
+        x_spatial = conv2d_nchw(params["conv_spatial"], binary_input, out_dtype=activation_dtype)
+        x_global = linear(params["linear_global"], global_input, out_dtype=activation_dtype)
+        x = (x_spatial + x_global[:, :, None, None]).astype(activation_dtype)
+        return jnp.transpose(x.reshape(n, c, seq_len), (0, 2, 1))
+
+
+def forward_trunk(
+    params,
+    x,
+    config,
     rope_cache,
     attention_impl="manual",
     activation_dtype=jnp.float32,
     remat_blocks=False,
     scan_blocks=False,
 ):
-    c = config["hidden_size"]
     num_heads = config["num_heads"]
-    n = binary_input.shape[0]
-    seq_len = pos_len * pos_len
-
-    x_spatial = conv2d_nchw(params["conv_spatial"], binary_input, out_dtype=activation_dtype)
-    x_global = linear(params["linear_global"], global_input, out_dtype=activation_dtype)
-    x = (x_spatial + x_global[:, :, None, None]).astype(activation_dtype)
-    x = jnp.transpose(x.reshape(n, c, seq_len), (0, 2, 1))
 
     rope_cos, rope_sin = rope_cache
 
@@ -301,20 +318,24 @@ def forward(
     if remat_blocks:
         apply_block = jax.checkpoint(apply_block)
 
-    if isinstance(params["blocks"], dict) and scan_blocks:
-        def scan_body(x_carry, block):
-            return apply_block(block, x_carry), None
+    with jax.named_scope("trunk"):
+        if isinstance(params["blocks"], dict) and scan_blocks:
+            def scan_body(x_carry, block):
+                return apply_block(block, x_carry), None
 
-        x, _ = jax.lax.scan(scan_body, x, params["blocks"])
-    elif isinstance(params["blocks"], dict):
-        num_layers = params["blocks"]["norm1"]["weight"].shape[0]
-        for i in range(num_layers):
-            x = apply_block(tree_index(params["blocks"], i), x)
-    else:
-        for block in params["blocks"]:
-            x = apply_block(block, x)
-    x = rms_norm(params["norm_final"], x).astype(jnp.float32)
+            x, _ = jax.lax.scan(scan_body, x, params["blocks"])
+        elif isinstance(params["blocks"], dict):
+            num_layers = params["blocks"]["norm1"]["weight"].shape[0]
+            for i in range(num_layers):
+                x = apply_block(tree_index(params["blocks"], i), x)
+        else:
+            for block in params["blocks"]:
+                x = apply_block(block, x)
+        return rms_norm(params["norm_final"], x).astype(jnp.float32)
 
+
+def forward_heads(params, x, pos_len):
+    n = x.shape[0]
     board = jnp.transpose(linear(params["policy_head"]["linear_board"], x), (0, 2, 1))
     pooled = jnp.mean(x, axis=1)
     pass_logits = linear(params["policy_head"]["linear_pass"], pooled)
@@ -338,6 +359,33 @@ def forward(
         out_ownership, out_scoring, out_futurepos, out_seki,
         out_scorebelief,
     )
+
+
+def forward(
+    params,
+    binary_input,
+    global_input,
+    config,
+    pos_len,
+    rope_cache,
+    attention_impl="manual",
+    activation_dtype=jnp.float32,
+    remat_blocks=False,
+    scan_blocks=False,
+):
+    x = forward_stem(params, binary_input, global_input, config, pos_len, activation_dtype)
+    x = forward_trunk(
+        params,
+        x,
+        config,
+        rope_cache,
+        attention_impl=attention_impl,
+        activation_dtype=activation_dtype,
+        remat_blocks=remat_blocks,
+        scan_blocks=scan_blocks,
+    )
+    with jax.named_scope("heads"):
+        return forward_heads(params, x, pos_len)
 
 
 def score_belief_offsets(pos_len):
