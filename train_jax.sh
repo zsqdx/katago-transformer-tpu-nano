@@ -43,6 +43,9 @@ fi
 if [ "${DONATE_TRAIN_BUFFERS:-0}" != "0" ]; then
     EXTRA_FLAGS+=(--donate-train-buffers)
 fi
+if [ "${STACK_BLOCKS:-0}" != "0" ]; then
+    EXTRA_FLAGS+=(--stack-blocks)
+fi
 if [ "${SCAN_BLOCKS:-0}" != "0" ]; then
     EXTRA_FLAGS+=(--scan-blocks)
 fi

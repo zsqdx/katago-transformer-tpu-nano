@@ -55,13 +55,23 @@ def stack_tree_sequence(sequence):
     return jnp.stack(sequence, axis=0)
 
 
+def tree_index(tree, index):
+    if isinstance(tree, dict):
+        return {k: tree_index(v, index) for k, v in tree.items()}
+    if isinstance(tree, tuple):
+        return tuple(tree_index(v, index) for v in tree)
+    if isinstance(tree, list):
+        return [tree_index(v, index) for v in tree]
+    return tree[index]
+
+
 def linear(params, x, out_dtype=jnp.float32):
     y = jnp.matmul(
         x.astype(COMPUTE_DTYPE),
         jnp.swapaxes(params["w"], -1, -2).astype(COMPUTE_DTYPE),
-    ).astype(jnp.float32)
+    )
     if "b" in params:
-        y = y + params["b"]
+        y = y.astype(jnp.float32) + params["b"]
     return y.astype(out_dtype)
 
 
@@ -263,6 +273,7 @@ def forward(
     attention_impl="manual",
     activation_dtype=jnp.float32,
     remat_blocks=False,
+    scan_blocks=False,
 ):
     c = config["hidden_size"]
     num_heads = config["num_heads"]
@@ -290,11 +301,15 @@ def forward(
     if remat_blocks:
         apply_block = jax.checkpoint(apply_block)
 
-    if isinstance(params["blocks"], dict):
+    if isinstance(params["blocks"], dict) and scan_blocks:
         def scan_body(x_carry, block):
             return apply_block(block, x_carry), None
 
         x, _ = jax.lax.scan(scan_body, x, params["blocks"])
+    elif isinstance(params["blocks"], dict):
+        num_layers = params["blocks"]["norm1"]["weight"].shape[0]
+        for i in range(num_layers):
+            x = apply_block(tree_index(params["blocks"], i), x)
     else:
         for block in params["blocks"]:
             x = apply_block(block, x)

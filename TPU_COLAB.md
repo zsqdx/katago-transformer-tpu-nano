@@ -484,6 +484,9 @@ activations, trainable parameters, and AdamW moment buffers in BF16. All remain
 Set `DONATE_TRAIN_BUFFERS=1` to let JAX donate parameter buffers across each
 compiled train call. This can reduce memory pressure, but it is opt-in because
 broader donation can expose buffer-aliasing issues on some runs.
+Set `STACK_BLOCKS=1` to store all transformer block parameters as stacked layer
+arrays while still using the regular unrolled block loop. This is useful for
+isolating optimizer/tree layout overhead from `lax.scan` throughput effects.
 Set `SCAN_BLOCKS=1` to store transformer block parameters as stacked layer
 arrays and run the trunk with `jax.lax.scan`; this can reduce compile latency,
 but early `b24c1024` profiling showed lower stable throughput than the regular

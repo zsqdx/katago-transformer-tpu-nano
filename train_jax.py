@@ -232,6 +232,7 @@ def main():
                         choices=["float32", "fp32", "bfloat16", "bf16"])
     parser.add_argument("--log-grad-norm", action="store_true")
     parser.add_argument("--donate-train-buffers", action="store_true")
+    parser.add_argument("--stack-blocks", action="store_true")
     parser.add_argument("--scan-blocks", action="store_true")
     parser.add_argument("--remat-blocks", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
@@ -299,8 +300,9 @@ def main():
         if int(meta.get("pos_len", args.pos_len)) != args.pos_len:
             raise ValueError(f"{checkpoint_path}: checkpoint pos_len does not match {args.pos_len}")
         state_params = state["params"]
-        if isinstance(state_params.get("blocks"), dict) != args.scan_blocks:
-            raise ValueError(f"{checkpoint_path}: checkpoint scan_blocks layout does not match --scan-blocks")
+        expected_stacked_blocks = args.stack_blocks or args.scan_blocks
+        if isinstance(state_params.get("blocks"), dict) != expected_stacked_blocks:
+            raise ValueError(f"{checkpoint_path}: checkpoint block layout does not match --stack-blocks/--scan-blocks")
         params = jax.device_put(_tree_map(lambda x: jnp.asarray(x, dtype=param_dtype), state_params))
         opt_state = jax.device_put(_tree_map(lambda x: jnp.asarray(x, dtype=opt_state_dtype), state["opt_state"]))
         step = int(meta.get("step", 0))
@@ -317,7 +319,7 @@ def main():
             init_std=args.init_std,
             score_mode=args.score_mode,
             fuse_projections=args.fuse_projections and not args.separate_projections,
-            stack_blocks=args.scan_blocks,
+            stack_blocks=args.stack_blocks or args.scan_blocks,
         )
         params = _tree_map(lambda x: x.astype(param_dtype), params)
         params = jax.device_put(params)
@@ -330,7 +332,8 @@ def main():
                                     model_config, args.pos_len, rope_cache,
                                     attention_impl=args.attention_impl,
                                     activation_dtype=activation_dtype,
-                                    remat_blocks=args.remat_blocks)
+                                    remat_blocks=args.remat_blocks,
+                                    scan_blocks=args.scan_blocks)
         return jax_losses.postprocess_and_loss_core(
             outputs,
             score_offsets,
@@ -448,6 +451,7 @@ def main():
             "activation_dtype": args.activation_dtype,
             "param_dtype": args.param_dtype,
             "opt_state_dtype": args.opt_state_dtype,
+            "stack_blocks": args.stack_blocks or args.scan_blocks,
             "scan_blocks": args.scan_blocks,
             "remat_blocks": args.remat_blocks,
         }
