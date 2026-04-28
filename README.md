@@ -150,6 +150,9 @@ ops, `PARAM_DTYPE=bf16` stores trainable parameters in BF16, and
 Set `DONATE_TRAIN_BUFFERS=1` to let JAX donate the parameter buffers across
 each compiled train call; this may reduce memory pressure, but it is kept
 opt-in because broader donation can expose buffer-aliasing issues.
+Set `SCAN_BLOCKS=1` to store transformer block parameters as stacked layer
+arrays and run the trunk with `jax.lax.scan`, which is useful for profiling
+deeper models such as `b24c1024`.
 
 ## CUDA Training Example
 

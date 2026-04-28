@@ -43,6 +43,9 @@ fi
 if [ "${DONATE_TRAIN_BUFFERS:-0}" != "0" ]; then
     EXTRA_FLAGS+=(--donate-train-buffers)
 fi
+if [ "${SCAN_BLOCKS:-0}" != "0" ]; then
+    EXTRA_FLAGS+=(--scan-blocks)
+fi
 
 MAX_TRAINING_SAMPLES_VALUE="${MAX_TRAINING_SAMPLES:-32768}"
 SAVE_EVERY_SAMPLES_VALUE="${SAVE_EVERY_SAMPLES:-${MAX_TRAINING_SAMPLES_VALUE}}"

@@ -44,6 +44,17 @@ def init_conv(key, in_ch, out_ch, kernel, std):
     return {"w": _normal(key, (out_ch, in_ch, kernel, kernel), std)}
 
 
+def stack_tree_sequence(sequence):
+    first = sequence[0]
+    if isinstance(first, dict):
+        return {k: stack_tree_sequence([item[k] for item in sequence]) for k in first}
+    if isinstance(first, tuple):
+        return tuple(stack_tree_sequence([item[i] for item in sequence]) for i in range(len(first)))
+    if isinstance(first, list):
+        return [stack_tree_sequence([item[i] for item in sequence]) for i in range(len(first))]
+    return jnp.stack(sequence, axis=0)
+
+
 def linear(params, x, out_dtype=jnp.float32):
     y = jnp.matmul(
         x.astype(COMPUTE_DTYPE),
@@ -133,7 +144,15 @@ def attention(q, k, v, mask=None, attention_impl="manual", out_dtype=jnp.float32
     return jnp.transpose(out, (0, 2, 1, 3))
 
 
-def init_params(key, config, pos_len, init_std=0.02, score_mode="simple", fuse_projections=False):
+def init_params(
+    key,
+    config,
+    pos_len,
+    init_std=0.02,
+    score_mode="simple",
+    fuse_projections=False,
+    stack_blocks=False,
+):
     if score_mode != "simple":
         raise ValueError("The first JAX TPU path currently supports score_mode='simple' only")
 
@@ -175,6 +194,8 @@ def init_params(key, config, pos_len, init_std=0.02, score_mode="simple", fuse_p
                 "ffn_wgate": init_linear(next(keys), c, ffn_dim, init_std, bias=False),
             })
         params["blocks"].append(block)
+    if stack_blocks:
+        params["blocks"] = stack_tree_sequence(params["blocks"])
     params["norm_final"] = {"weight": jnp.ones((c,), dtype=jnp.float32)}
     params["policy_head"] = {
         "linear_board": init_linear(next(keys), c, 6, init_std, bias=True),
@@ -253,16 +274,30 @@ def forward(
     x = jnp.transpose(x.reshape(n, c, seq_len), (0, 2, 1))
 
     rope_cos, rope_sin = rope_cache
-    for block in params["blocks"]:
-        x = transformer_block(
-            block,
-            x,
-            rope_cos,
-            rope_sin,
-            num_heads,
-            attention_impl=attention_impl,
-            activation_dtype=activation_dtype,
-        )
+    if isinstance(params["blocks"], dict):
+        def scan_body(x_carry, block):
+            return transformer_block(
+                block,
+                x_carry,
+                rope_cos,
+                rope_sin,
+                num_heads,
+                attention_impl=attention_impl,
+                activation_dtype=activation_dtype,
+            ), None
+
+        x, _ = jax.lax.scan(scan_body, x, params["blocks"])
+    else:
+        for block in params["blocks"]:
+            x = transformer_block(
+                block,
+                x,
+                rope_cos,
+                rope_sin,
+                num_heads,
+                attention_impl=attention_impl,
+                activation_dtype=activation_dtype,
+            )
     x = rms_norm(params["norm_final"], x).astype(jnp.float32)
 
     board = jnp.transpose(linear(params["policy_head"]["linear_board"], x), (0, 2, 1))
