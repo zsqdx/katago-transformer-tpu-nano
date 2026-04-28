@@ -245,6 +245,8 @@ def main():
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--wd", type=float, default=0.1)
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sgd", "none"])
+    parser.add_argument("--loss-profile", type=str, default="full",
+                        choices=["full", "policy_value", "policy_only", "value_only"])
     parser.add_argument("--grad-clip-norm", type=float, default=0.0)
     parser.add_argument("--lr-schedule", type=str, default="cosine", choices=["cosine", "constant"])
     parser.add_argument("--max-training-samples", type=int, default=32768)
@@ -374,6 +376,16 @@ def main():
                                     activation_dtype=activation_dtype,
                                     remat_blocks=args.remat_blocks,
                                     scan_blocks=args.scan_blocks)
+        if args.loss_profile != "full":
+            return jax_losses.profile_loss_core(
+                outputs,
+                batch_["policyTargetsNCMove"],
+                batch_["globalTargetsNC"],
+                moving_sum_,
+                moving_weight_,
+                profile=args.loss_profile,
+                value_loss_scale=0.6,
+            )
         return jax_losses.postprocess_and_loss_core(
             outputs,
             score_offsets,
@@ -499,6 +511,7 @@ def main():
             "model_config": model_config,
             "pos_len": args.pos_len,
             "optimizer": args.optimizer,
+            "loss_profile": args.loss_profile,
             "moving_sum": float(jax.device_get(moving_sum)),
             "moving_weight": float(jax.device_get(moving_weight)),
             "fuse_projections": args.fuse_projections and not args.separate_projections,

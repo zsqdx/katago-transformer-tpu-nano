@@ -34,6 +34,68 @@ def softplus_floor(x, square=False):
     return jax.nn.softplus(x)
 
 
+def profile_loss_core(
+    outputs,
+    target_policy_ncmove,
+    target_global,
+    moving_unowned_proportion_sum,
+    moving_unowned_proportion_weight,
+    profile="policy_value",
+    value_loss_scale=0.6,
+):
+    policy_logits, value_logits = outputs[0], outputs[1]
+    n = policy_logits.shape[0]
+
+    global_weight = target_global[:, 25]
+    target_weight_policy_player = target_global[:, 26]
+    target_weight_value = 1.0 - target_global[:, 35]
+
+    target_policy_player = target_policy_ncmove[:, 0, :]
+    target_policy_player = target_policy_player / jnp.sum(target_policy_player, axis=1, keepdims=True)
+    target_value = target_global[:, 0:3]
+
+    zero = jnp.asarray(0.0, dtype=jnp.float32)
+    loss_policy_player = zero
+    loss_value = zero
+    policy_acc1 = zero
+
+    if profile in ("policy_value", "policy_only"):
+        loss_policy_player = (global_weight * target_weight_policy_player * cross_entropy(
+            policy_logits[:, 0, :], target_policy_player, axis=1
+        )).sum()
+        policy_acc1 = (global_weight * target_weight_policy_player * (
+            jnp.argmax(policy_logits[:, 0, :], axis=1) == jnp.argmax(target_policy_player, axis=1)
+        ).astype(jnp.float32)).sum()
+
+    if profile in ("policy_value", "value_only"):
+        loss_value = 1.20 * (global_weight * target_weight_value * cross_entropy(
+            value_logits, target_value, axis=1
+        )).sum()
+
+    if profile == "policy_value":
+        loss_sum = (loss_policy_player * 0.93 + loss_value * value_loss_scale) / n
+    elif profile == "policy_only":
+        loss_sum = loss_policy_player * 0.93 / n
+    elif profile == "value_only":
+        loss_sum = loss_value * value_loss_scale / n
+    else:
+        raise ValueError(f"Unknown loss profile: {profile}")
+
+    metrics = jnp.stack([
+        loss_sum, loss_policy_player, zero,
+        zero, zero,
+        zero, zero,
+        loss_value, zero, zero, zero,
+        zero, zero, zero,
+        zero, zero, zero,
+        zero, zero, zero,
+        zero, zero,
+        zero, zero,
+        policy_acc1, global_weight.sum(),
+    ])
+    return loss_sum, metrics, moving_unowned_proportion_sum, moving_unowned_proportion_weight
+
+
 def postprocess_and_loss_core(
     outputs,
     score_belief_offset_vector,

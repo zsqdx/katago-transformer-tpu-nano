@@ -487,6 +487,9 @@ Set `OPTIMIZER=none` or `OPTIMIZER=sgd` only for profiling optimizer overhead:
 `none` skips parameter updates and may let XLA eliminate unused backward work,
 so treat it as a forward/loss lower-bound probe; `sgd` keeps gradients live
 with a minimal weight-decayed SGD update.
+Set `LOSS_PROFILE=policy_value`, `policy_only`, or `value_only` only for
+profiling loss/head overhead. These modes deliberately drop auxiliary losses
+and let XLA eliminate unused heads, so they are not training-equivalent.
 Set `DONATE_TRAIN_BUFFERS=1` to let JAX donate parameter buffers across each
 compiled train call. This can reduce memory pressure, but it is opt-in because
 broader donation can expose buffer-aliasing issues on some runs.
