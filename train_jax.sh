@@ -66,6 +66,7 @@ python -u train_jax.py \
     --model-kind "${MODEL_KIND:-b12c2048}" \
     --lr "${LR:-2e-4}" \
     --wd "${WD:-0.1}" \
+    --optimizer "${OPTIMIZER:-adamw}" \
     --grad-clip-norm "${GRAD_CLIP_NORM:-0}" \
     --lr-schedule "${LR_SCHEDULE:-cosine}" \
     --max-training-samples "${MAX_TRAINING_SAMPLES_VALUE}" \

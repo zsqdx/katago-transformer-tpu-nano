@@ -133,6 +133,33 @@ def adamw_update(
     }
 
 
+def sgd_update(
+    params,
+    grads,
+    lr,
+    wd,
+    param_dtype=None,
+    update_dtype=None,
+):
+    import jax.numpy as jnp
+
+    param_dtype = jnp.float32 if param_dtype is None else param_dtype
+    update_dtype = jnp.float32 if update_dtype is None else update_dtype
+    lr_v = jnp.asarray(lr, dtype=update_dtype)
+    wd_v = jnp.asarray(wd, dtype=update_dtype)
+
+    def update_leaf(path, p, g):
+        p_new = p.astype(update_dtype) - lr_v * g.astype(update_dtype)
+        if _decay_mask_for_path(path):
+            p_new = p_new - lr_v * wd_v * p.astype(update_dtype)
+        return p_new.astype(param_dtype)
+
+    return _tree_map_with_path(
+        lambda path, p: update_leaf(path, p, _get_path(grads, path)),
+        params,
+    )
+
+
 def _get_path(tree, path):
     cur = tree
     for part in path:
@@ -217,6 +244,7 @@ def main():
     parser.add_argument("--model-kind", type=str, default="b12c2048")
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--wd", type=float, default=0.1)
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sgd", "none"])
     parser.add_argument("--grad-clip-norm", type=float, default=0.0)
     parser.add_argument("--lr-schedule", type=str, default="cosine", choices=["cosine", "constant"])
     parser.add_argument("--max-training-samples", type=int, default=32768)
@@ -377,12 +405,25 @@ def main():
         if args.grad_clip_norm > 0:
             scale = jnp.minimum(1.0, args.grad_clip_norm / (grad_norm + 1e-6))
             grads = _tree_map(lambda g: g * scale, grads)
-        new_params, new_opt_state = adamw_update(
-            params_, grads, opt_state_, opt_step, lr, wd,
-            state_dtype=opt_state_dtype,
-            param_dtype=param_dtype,
-            update_dtype=opt_update_dtype,
-        )
+        if args.optimizer == "adamw":
+            new_params, new_opt_state = adamw_update(
+                params_, grads, opt_state_, opt_step, lr, wd,
+                state_dtype=opt_state_dtype,
+                param_dtype=param_dtype,
+                update_dtype=opt_update_dtype,
+            )
+        elif args.optimizer == "sgd":
+            new_params = sgd_update(
+                params_, grads, lr, wd,
+                param_dtype=param_dtype,
+                update_dtype=opt_update_dtype,
+            )
+            new_opt_state = opt_state_
+        elif args.optimizer == "none":
+            new_params = params_
+            new_opt_state = opt_state_
+        else:
+            raise ValueError(f"Unknown optimizer: {args.optimizer}")
         return new_params, new_opt_state, new_moving_sum, new_moving_weight, metrics, grad_norm
 
     def train_steps_impl(params_, opt_state_, batches_, moving_sum_, moving_weight_, opt_steps, lrs, wds):
@@ -457,6 +498,7 @@ def main():
             "samples": total_samples,
             "model_config": model_config,
             "pos_len": args.pos_len,
+            "optimizer": args.optimizer,
             "moving_sum": float(jax.device_get(moving_sum)),
             "moving_weight": float(jax.device_get(moving_weight)),
             "fuse_projections": args.fuse_projections and not args.separate_projections,

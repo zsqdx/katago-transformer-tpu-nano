@@ -149,6 +149,10 @@ ops, `PARAM_DTYPE=bf16` stores trainable parameters in BF16, and
 `OPT_UPDATE_DTYPE=bf16` also runs the AdamW update math in BF16, which is a
 more aggressive optimizer-throughput A/B. All default to `float32` until their
 training impact is measured.
+Set `OPTIMIZER=none` or `OPTIMIZER=sgd` only for profiling optimizer overhead:
+`none` skips parameter updates and may let XLA eliminate unused backward work,
+so treat it as a forward/loss lower-bound probe; `sgd` keeps gradients live
+with a minimal weight-decayed SGD update.
 Set `DONATE_TRAIN_BUFFERS=1` to let JAX donate the parameter buffers across
 each compiled train call; this may reduce memory pressure, but it is kept
 opt-in because broader donation can expose buffer-aliasing issues.
