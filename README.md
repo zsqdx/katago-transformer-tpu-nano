@@ -145,8 +145,10 @@ the old log field for debugging.
 Mixed-precision A/B switches are also available for TPU profiling:
 `ACTIVATION_DTYPE=bf16` keeps trunk activations in BF16 between transformer
 ops, `PARAM_DTYPE=bf16` stores trainable parameters in BF16, and
-`OPT_STATE_DTYPE=bf16` stores AdamW moment buffers in BF16. All default to
-`float32` until their training impact is measured.
+`OPT_STATE_DTYPE=bf16` stores AdamW moment buffers in BF16.
+`OPT_UPDATE_DTYPE=bf16` also runs the AdamW update math in BF16, which is a
+more aggressive optimizer-throughput A/B. All default to `float32` until their
+training impact is measured.
 Set `DONATE_TRAIN_BUFFERS=1` to let JAX donate the parameter buffers across
 each compiled train call; this may reduce memory pressure, but it is kept
 opt-in because broader donation can expose buffer-aliasing issues.

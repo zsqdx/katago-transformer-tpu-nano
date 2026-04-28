@@ -80,6 +80,7 @@ def adamw_update(
     wd,
     state_dtype=None,
     param_dtype=None,
+    update_dtype=None,
     beta1=0.9,
     beta2=0.95,
     eps=1e-8,
@@ -88,25 +89,33 @@ def adamw_update(
 
     state_dtype = jnp.float32 if state_dtype is None else state_dtype
     param_dtype = jnp.float32 if param_dtype is None else param_dtype
+    update_dtype = jnp.float32 if update_dtype is None else update_dtype
+    beta1_v = jnp.asarray(beta1, dtype=update_dtype)
+    beta2_v = jnp.asarray(beta2, dtype=update_dtype)
+    one_v = jnp.asarray(1.0, dtype=update_dtype)
     new_m = _tree_map(
-        lambda m, g: beta1 * m.astype(jnp.float32) + (1.0 - beta1) * g.astype(jnp.float32),
+        lambda m, g: beta1_v * m.astype(update_dtype) + (one_v - beta1_v) * g.astype(update_dtype),
         state["m"],
         grads,
     )
     new_v = _tree_map(
-        lambda v, g: beta2 * v.astype(jnp.float32) + (1.0 - beta2) * jnp.square(g.astype(jnp.float32)),
+        lambda v, g: beta2_v * v.astype(update_dtype) + (one_v - beta2_v) * jnp.square(g.astype(update_dtype)),
         state["v"],
         grads,
     )
-    bc1 = 1.0 - beta1 ** step
-    bc2 = 1.0 - beta2 ** step
+    bc1 = jnp.asarray(1.0 - beta1 ** step, dtype=update_dtype)
+    bc2 = jnp.asarray(1.0 - beta2 ** step, dtype=update_dtype)
+    eps_v = jnp.asarray(eps, dtype=update_dtype)
+    lr_v = jnp.asarray(lr, dtype=update_dtype)
+    wd_v = jnp.asarray(wd, dtype=update_dtype)
 
     def update_leaf(path, p, m, v):
         m_hat = m / bc1
         v_hat = v / bc2
-        p_new = p - lr * (m_hat / (jnp.sqrt(v_hat) + eps))
+        p_update = m_hat / (jnp.sqrt(v_hat) + eps_v)
+        p_new = p.astype(update_dtype) - lr_v * p_update
         if _decay_mask_for_path(path):
-            p_new = p_new - lr * wd * p
+            p_new = p_new - lr_v * wd_v * p.astype(update_dtype)
         return p_new
 
     new_params = _tree_map_with_path(
@@ -230,6 +239,8 @@ def main():
                         choices=["float32", "fp32", "bfloat16", "bf16"])
     parser.add_argument("--opt-state-dtype", type=str, default="float32",
                         choices=["float32", "fp32", "bfloat16", "bf16"])
+    parser.add_argument("--opt-update-dtype", type=str, default="float32",
+                        choices=["float32", "fp32", "bfloat16", "bf16"])
     parser.add_argument("--log-grad-norm", action="store_true")
     parser.add_argument("--donate-train-buffers", action="store_true")
     parser.add_argument("--stack-blocks", action="store_true")
@@ -263,6 +274,7 @@ def main():
     activation_dtype = jax_model.dtype_from_name(args.activation_dtype)
     param_dtype = jax_model.dtype_from_name(args.param_dtype)
     opt_state_dtype = jax_model.dtype_from_name(args.opt_state_dtype)
+    opt_update_dtype = jax_model.dtype_from_name(args.opt_update_dtype)
 
     os.makedirs(args.traindir, exist_ok=True)
     logging.basicConfig(
@@ -369,6 +381,7 @@ def main():
             params_, grads, opt_state_, opt_step, lr, wd,
             state_dtype=opt_state_dtype,
             param_dtype=param_dtype,
+            update_dtype=opt_update_dtype,
         )
         return new_params, new_opt_state, new_moving_sum, new_moving_weight, metrics, grad_norm
 
@@ -451,6 +464,7 @@ def main():
             "activation_dtype": args.activation_dtype,
             "param_dtype": args.param_dtype,
             "opt_state_dtype": args.opt_state_dtype,
+            "opt_update_dtype": args.opt_update_dtype,
             "stack_blocks": args.stack_blocks or args.scan_blocks,
             "scan_blocks": args.scan_blocks,
             "remat_blocks": args.remat_blocks,

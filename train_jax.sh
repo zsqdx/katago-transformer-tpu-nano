@@ -81,6 +81,7 @@ python -u train_jax.py \
     --activation-dtype "${ACTIVATION_DTYPE:-float32}" \
     --param-dtype "${PARAM_DTYPE:-float32}" \
     --opt-state-dtype "${OPT_STATE_DTYPE:-float32}" \
+    --opt-update-dtype "${OPT_UPDATE_DTYPE:-float32}" \
     --xla-peak-tflops "${XLA_PEAK_TFLOPS:-918}" \
     --allow-nonfull-mask \
     --seed "${SEED:-1234}" \

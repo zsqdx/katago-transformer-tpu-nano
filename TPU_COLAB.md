@@ -479,8 +479,10 @@ that diagnostic back.
 
 For profiling only, you can also test `ACTIVATION_DTYPE=bf16`,
 `PARAM_DTYPE=bf16`, and `OPT_STATE_DTYPE=bf16`. These respectively keep trunk
-activations, trainable parameters, and AdamW moment buffers in BF16. All remain
-`float32` by default until their effect on training quality is measured.
+activations, trainable parameters, and AdamW moment buffers in BF16.
+`OPT_UPDATE_DTYPE=bf16` additionally runs the AdamW update math in BF16, making
+it a more aggressive optimizer-throughput A/B. All remain `float32` by default
+until their effect on training quality is measured.
 Set `DONATE_TRAIN_BUFFERS=1` to let JAX donate parameter buffers across each
 compiled train call. This can reduce memory pressure, but it is opt-in because
 broader donation can expose buffer-aliasing issues on some runs.
