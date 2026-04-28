@@ -187,7 +187,8 @@ For faster Muon probes, set `MUON_TARGET=attn`, `ffn`, `square`, or `none`
 instead of the default `all`; non-targeted leaves fall back to AdamW. You can
 also set `MUON_POLAR_STEPS=3` or `4` to trade optimizer precision for speed.
 Use `bash sweep_jax_muon_fast.sh` for a very short throughput sweep over these
-Muon knobs; override `SWEEP_SPECS` with entries like `attn:3:64`.
+Muon knobs; override `SWEEP_SPECS` with entries like `attn:3:64`, and set
+`SWEEP_STACK_BLOCKS=1` to test the stacked block layout.
 Muon normally compiles as one train-step JIT so XLA can keep gradients inside
 the compiled program. If that compile stalls on a larger shape, set
 `MUON_SPLIT_JIT=1` as a slower fallback that compiles loss/grad and optimizer

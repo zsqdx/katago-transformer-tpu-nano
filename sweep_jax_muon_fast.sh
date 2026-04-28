@@ -19,6 +19,7 @@ BATCH_SIZE_VALUE="${BATCH_SIZE:-24}"
 MAX_TRAINING_SAMPLES_VALUE="${MAX_TRAINING_SAMPLES:-960}"
 WARMUP_SAMPLES_VALUE="${WARMUP_SAMPLES:-480}"
 PRINT_EVERY_VALUE="${PRINT_EVERY:-20}"
+SWEEP_STACK_BLOCKS="${SWEEP_STACK_BLOCKS:-0}"
 
 mkdir -p "${SWEEP_ROOT}/logs"
 
@@ -30,6 +31,7 @@ echo "  specs: ${SWEEP_SPECS}"
 echo "  max_training_samples: ${MAX_TRAINING_SAMPLES_VALUE}"
 echo "  warmup_samples: ${WARMUP_SAMPLES_VALUE}"
 echo "  print_every: ${PRINT_EVERY_VALUE}"
+echo "  stack_blocks: ${SWEEP_STACK_BLOCKS}"
 echo
 
 run_index=0
@@ -61,6 +63,7 @@ for spec in ${SWEEP_SPECS}; do
             SAVE_EVERY_SAMPLES=1000000000 \
             VAL_EVERY_SAMPLES=1000000000 \
             MAX_VAL_BATCHES=0 \
+            STACK_BLOCKS="${SWEEP_STACK_BLOCKS}" \
             NO_RESUME=1 \
             NO_FINAL_SAVE=1 \
             TRAINDIR="${traindir}" \
@@ -80,6 +83,7 @@ for spec in ${SWEEP_SPECS}; do
         SAVE_EVERY_SAMPLES=1000000000 \
         VAL_EVERY_SAMPLES=1000000000 \
         MAX_VAL_BATCHES=0 \
+        STACK_BLOCKS="${SWEEP_STACK_BLOCKS}" \
         NO_RESUME=1 \
         NO_FINAL_SAVE=1 \
         TRAINDIR="${traindir}" \
@@ -162,6 +166,7 @@ for log in logs:
         "row_split": args.get("muon_row_split_size", fallback_row_split),
         "model": args.get("model_kind", "?"),
         "batch": args.get("batch_size", "?"),
+        "stack_blocks": args.get("stack_blocks", "?"),
         "muon_update_t_per_step": float(muon_flops_match.group("flops")) if muon_flops_match else None,
         "windows": len(train_rows),
         "stable_windows": len(stable),
@@ -193,7 +198,7 @@ for log in logs:
 
 rows.sort(key=lambda x: (x["best_mfu"], x["median_mfu"]), reverse=True)
 fields = [
-    "status", "target", "polar_steps", "row_split", "model", "batch",
+    "status", "target", "polar_steps", "row_split", "model", "batch", "stack_blocks",
     "best_mfu", "median_mfu", "last_mfu", "best_tflops", "median_tflops",
     "median_sps", "muon_update_t_per_step", "windows", "stable_windows", "log",
 ]
