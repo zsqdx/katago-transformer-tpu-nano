@@ -67,6 +67,7 @@ python -u train_jax.py \
     --score-mode "${SCORE_MODE:-simple}" \
     --attention-impl "${ATTENTION_IMPL:-manual}" \
     --activation-dtype "${ACTIVATION_DTYPE:-float32}" \
+    --param-dtype "${PARAM_DTYPE:-float32}" \
     --opt-state-dtype "${OPT_STATE_DTYPE:-float32}" \
     --xla-peak-tflops "${XLA_PEAK_TFLOPS:-918}" \
     --allow-nonfull-mask \

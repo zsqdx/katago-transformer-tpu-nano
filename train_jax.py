@@ -71,10 +71,23 @@ def init_adam_state(params, dtype=None):
     return {"m": zeros, "v": zeros}
 
 
-def adamw_update(params, grads, state, step, lr, wd, state_dtype=None, beta1=0.9, beta2=0.95, eps=1e-8):
+def adamw_update(
+    params,
+    grads,
+    state,
+    step,
+    lr,
+    wd,
+    state_dtype=None,
+    param_dtype=None,
+    beta1=0.9,
+    beta2=0.95,
+    eps=1e-8,
+):
     import jax.numpy as jnp
 
     state_dtype = jnp.float32 if state_dtype is None else state_dtype
+    param_dtype = jnp.float32 if param_dtype is None else param_dtype
     new_m = _tree_map(
         lambda m, g: beta1 * m.astype(jnp.float32) + (1.0 - beta1) * g.astype(jnp.float32),
         state["m"],
@@ -105,7 +118,7 @@ def adamw_update(params, grads, state, step, lr, wd, state_dtype=None, beta1=0.9
         ),
         params,
     )
-    return new_params, {
+    return _tree_map(lambda p: p.astype(param_dtype), new_params), {
         "m": _tree_map(lambda m: m.astype(state_dtype), new_m),
         "v": _tree_map(lambda v: v.astype(state_dtype), new_v),
     }
@@ -213,6 +226,8 @@ def main():
     parser.add_argument("--attention-impl", type=str, default="manual", choices=["manual", "xla"])
     parser.add_argument("--activation-dtype", type=str, default="float32",
                         choices=["float32", "fp32", "bfloat16", "bf16"])
+    parser.add_argument("--param-dtype", type=str, default="float32",
+                        choices=["float32", "fp32", "bfloat16", "bf16"])
     parser.add_argument("--opt-state-dtype", type=str, default="float32",
                         choices=["float32", "fp32", "bfloat16", "bf16"])
     parser.add_argument("--log-grad-norm", action="store_true")
@@ -242,6 +257,7 @@ def main():
     import jax.numpy as jnp
 
     activation_dtype = jax_model.dtype_from_name(args.activation_dtype)
+    param_dtype = jax_model.dtype_from_name(args.param_dtype)
     opt_state_dtype = jax_model.dtype_from_name(args.opt_state_dtype)
 
     os.makedirs(args.traindir, exist_ok=True)
@@ -279,7 +295,7 @@ def main():
             raise ValueError(f"{checkpoint_path}: checkpoint model_config does not match {args.model_kind}")
         if int(meta.get("pos_len", args.pos_len)) != args.pos_len:
             raise ValueError(f"{checkpoint_path}: checkpoint pos_len does not match {args.pos_len}")
-        params = jax.device_put(state["params"])
+        params = jax.device_put(_tree_map(lambda x: jnp.asarray(x, dtype=param_dtype), state["params"]))
         opt_state = jax.device_put(_tree_map(lambda x: jnp.asarray(x, dtype=opt_state_dtype), state["opt_state"]))
         step = int(meta.get("step", 0))
         total_samples = int(meta.get("samples", 0))
@@ -296,6 +312,7 @@ def main():
             score_mode=args.score_mode,
             fuse_projections=args.fuse_projections and not args.separate_projections,
         )
+        params = _tree_map(lambda x: x.astype(param_dtype), params)
         params = jax.device_put(params)
         opt_state = jax.device_put(init_adam_state(params, dtype=opt_state_dtype))
 
@@ -338,7 +355,9 @@ def main():
             scale = jnp.minimum(1.0, args.grad_clip_norm / (grad_norm + 1e-6))
             grads = _tree_map(lambda g: g * scale, grads)
         new_params, new_opt_state = adamw_update(
-            params_, grads, opt_state_, opt_step, lr, wd, state_dtype=opt_state_dtype
+            params_, grads, opt_state_, opt_step, lr, wd,
+            state_dtype=opt_state_dtype,
+            param_dtype=param_dtype,
         )
         return new_params, new_opt_state, new_moving_sum, new_moving_weight, metrics, grad_norm
 
@@ -415,6 +434,7 @@ def main():
             "fuse_projections": args.fuse_projections and not args.separate_projections,
             "attention_impl": args.attention_impl,
             "activation_dtype": args.activation_dtype,
+            "param_dtype": args.param_dtype,
             "opt_state_dtype": args.opt_state_dtype,
         }
 
