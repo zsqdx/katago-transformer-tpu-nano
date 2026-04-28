@@ -113,7 +113,7 @@ def attention(q, k, v, mask=None):
     return jnp.transpose(out, (0, 2, 1, 3))
 
 
-def init_params(key, config, pos_len, init_std=0.02, score_mode="simple"):
+def init_params(key, config, pos_len, init_std=0.02, score_mode="simple", fuse_projections=True):
     if score_mode != "simple":
         raise ValueError("The first JAX TPU path currently supports score_mode='simple' only")
 
@@ -126,7 +126,8 @@ def init_params(key, config, pos_len, init_std=0.02, score_mode="simple"):
     num_global = configs.get_num_global_input_features(config)
     scorebelief_len = (pos_len * pos_len + EXTRA_SCORE_DISTR_RADIUS) * 2
 
-    keys = iter(_split(key, 6 + num_layers * 7))
+    block_keys = 4 if fuse_projections else 7
+    keys = iter(_split(key, 6 + num_layers * block_keys))
     params = {
         "conv_spatial": init_conv(next(keys), num_bin, c, 3, init_std),
         "linear_global": init_linear(next(keys), num_global, c, init_std, bias=False),
@@ -134,17 +135,26 @@ def init_params(key, config, pos_len, init_std=0.02, score_mode="simple"):
     }
     out_std = init_std / math.sqrt(2.0 * num_layers)
     for _ in range(num_layers):
-        params["blocks"].append({
-            "q_proj": init_linear(next(keys), c, c, init_std, bias=False),
-            "k_proj": init_linear(next(keys), c, c, init_std, bias=False),
-            "v_proj": init_linear(next(keys), c, c, init_std, bias=False),
-            "out_proj": init_linear(next(keys), c, c, out_std, bias=False),
-            "ffn_w1": init_linear(next(keys), c, ffn_dim, init_std, bias=False),
-            "ffn_wgate": init_linear(next(keys), c, ffn_dim, init_std, bias=False),
-            "ffn_w2": init_linear(next(keys), ffn_dim, c, out_std, bias=False),
+        block = {
             "norm1": {"weight": jnp.ones((c,), dtype=jnp.float32)},
             "norm2": {"weight": jnp.ones((c,), dtype=jnp.float32)},
-        })
+            "out_proj": init_linear(next(keys), c, c, out_std, bias=False),
+            "ffn_w2": init_linear(next(keys), ffn_dim, c, out_std, bias=False),
+        }
+        if fuse_projections:
+            block.update({
+                "qkv_proj": init_linear(next(keys), c, 3 * c, init_std, bias=False),
+                "ffn_upgate": init_linear(next(keys), c, 2 * ffn_dim, init_std, bias=False),
+            })
+        else:
+            block.update({
+                "q_proj": init_linear(next(keys), c, c, init_std, bias=False),
+                "k_proj": init_linear(next(keys), c, c, init_std, bias=False),
+                "v_proj": init_linear(next(keys), c, c, init_std, bias=False),
+                "ffn_w1": init_linear(next(keys), c, ffn_dim, init_std, bias=False),
+                "ffn_wgate": init_linear(next(keys), c, ffn_dim, init_std, bias=False),
+            })
+        params["blocks"].append(block)
     params["norm_final"] = {"weight": jnp.ones((c,), dtype=jnp.float32)}
     params["policy_head"] = {
         "linear_board": init_linear(next(keys), c, 6, init_std, bias=True),
@@ -162,16 +172,28 @@ def transformer_block(params, x, rope_cos, rope_sin, num_heads):
     head_dim = channels // num_heads
 
     x_norm = rms_norm(params["norm1"], x)
-    q = linear(params["q_proj"], x_norm).reshape(bsz, seq_len, num_heads, head_dim)
-    k = linear(params["k_proj"], x_norm).reshape(bsz, seq_len, num_heads, head_dim)
-    v = linear(params["v_proj"], x_norm).reshape(bsz, seq_len, num_heads, head_dim)
+    if "qkv_proj" in params:
+        qkv = linear(params["qkv_proj"], x_norm)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+    else:
+        q = linear(params["q_proj"], x_norm)
+        k = linear(params["k_proj"], x_norm)
+        v = linear(params["v_proj"], x_norm)
+    q = q.reshape(bsz, seq_len, num_heads, head_dim)
+    k = k.reshape(bsz, seq_len, num_heads, head_dim)
+    v = v.reshape(bsz, seq_len, num_heads, head_dim)
     q, k = apply_rope(q, k, rope_cos, rope_sin)
     attn_out = attention(q, k, v).reshape(bsz, seq_len, channels)
     x = x + linear(params["out_proj"], attn_out)
 
     x_norm = rms_norm(params["norm2"], x)
-    w1 = silu(linear(params["ffn_w1"], x_norm))
-    wg = linear(params["ffn_wgate"], x_norm)
+    if "ffn_upgate" in params:
+        upgate = linear(params["ffn_upgate"], x_norm)
+        w1, wg = jnp.split(upgate, 2, axis=-1)
+        w1 = silu(w1)
+    else:
+        w1 = silu(linear(params["ffn_w1"], x_norm))
+        wg = linear(params["ffn_wgate"], x_norm)
     hidden = (w1.astype(jnp.float32) * wg.astype(jnp.float32)).astype(x.dtype)
     return x + linear(params["ffn_w2"], hidden)
 

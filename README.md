@@ -125,6 +125,9 @@ then filling in the remaining feature gaps.
 For deeper/narrower presets such as `b24c1024`, try `STEPS_PER_JIT=4` or `8`
 to execute several optimizer steps per XLA call. This reduces per-step dispatch
 overhead without changing the per-sample LR schedule or checkpoint semantics.
+New JAX runs also initialize fused QKV and fused SwiGLU up/gate projection
+weights by default, which reduces the number of per-block dot operations. Set
+`SEPARATE_PROJECTIONS=1` only for A/B comparisons with the older layout.
 
 ## CUDA Training Example
 

@@ -220,15 +220,15 @@ def postprocess_and_loss_core(
     loss_scoremean = 0.0015 * (global_weight * target_weight_ownership * huber_loss(
         pred_scoremean, target_scoremean, delta=12.0
     )).sum()
-    pred_cdf = jnp.cumsum(jax.nn.softmax(scorebelief_logits, axis=1), axis=1)
+    score_belief_probs = jnp.exp(scorebelief_logits)
+    pred_cdf = jnp.cumsum(score_belief_probs, axis=1)
     target_cdf = jnp.cumsum(target_score_distribution, axis=1)
     loss_sb_cdf = 0.020 * (global_weight * target_weight_ownership * jnp.sum(
         jnp.square(pred_cdf - target_cdf), axis=1
     )).sum()
-    loss_sb_pdf = 0.020 * (global_weight * target_weight_ownership * cross_entropy(
-        scorebelief_logits, target_score_distribution, axis=1
+    loss_sb_pdf = 0.020 * (global_weight * target_weight_ownership * (
+        -jnp.sum(target_score_distribution * scorebelief_logits, axis=1)
     )).sum()
-    score_belief_probs = jax.nn.softmax(scorebelief_logits, axis=1)
     score_belief_offsets = score_belief_offset_vector.reshape(1, -1)
     expected_score = jnp.sum(score_belief_probs * score_belief_offsets, axis=1, keepdims=True)
     stdev_of_belief = jnp.sqrt(

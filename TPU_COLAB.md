@@ -459,6 +459,11 @@ TRAINDIR=./jax_tpu_run_b24c1024_b16_s4 \
 bash train_jax.sh
 ```
 
+New JAX runs initialize fused QKV and fused SwiGLU up/gate projections by
+default. This keeps the math equivalent but gives XLA fewer, wider dot
+operations per transformer block. Set `SEPARATE_PROJECTIONS=1` only when you
+want to compare against the older unfused layout.
+
 For reference, the command expanded by `train.sh` is equivalent to:
 
 ```bash

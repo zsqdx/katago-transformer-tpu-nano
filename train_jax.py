@@ -195,6 +195,7 @@ def main():
     parser.add_argument("--enable-history-matrices", action="store_true")
     parser.add_argument("--allow-nonfull-mask", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--separate-projections", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--init-std", type=float, default=0.02)
     parser.add_argument("--score-mode", type=str, default="simple", choices=["simple"])
@@ -269,6 +270,7 @@ def main():
             args.pos_len,
             init_std=args.init_std,
             score_mode=args.score_mode,
+            fuse_projections=not args.separate_projections,
         )
         params = jax.device_put(params)
         opt_state = jax.device_put(init_adam_state(params))
@@ -379,6 +381,7 @@ def main():
             "pos_len": args.pos_len,
             "moving_sum": float(jax.device_get(moving_sum)),
             "moving_weight": float(jax.device_get(moving_weight)),
+            "fuse_projections": not args.separate_projections,
         }
 
     def log_metric_summary(prefix, samples, metrics_host, batch_count):
