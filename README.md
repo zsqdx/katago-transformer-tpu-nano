@@ -10,6 +10,8 @@ training loop can be iterated on independently.
 
 - CUDA training remains the primary, more complete path.
 - TPU support is an initial single-device smoke-test path via `--device xla`.
+- A separate JAX TPU prototype is available for direct PyTorch/XLA vs JAX/XLA
+  throughput comparisons on the same data and model presets.
 - The TPU path is intended for Colab `v6e-1` first, using AdamW only.
 - TransformerEngine, FP8, CUDA profiling, ZeRO, multi-GPU DDP, and
   `torch.compile` are not enabled on XLA yet.
@@ -19,13 +21,17 @@ training loop can be iterated on independently.
 ## Files
 
 - `train.py`: main training loop.
+- `train_jax.py`: JAX TPU prototype training loop.
 - `model.py`: pure PyTorch transformer model.
+- `jax_model.py`, `jax_losses.py`, `jax_data.py`: JAX/NumPy model, loss, and
+  data path used by `train_jax.py`.
 - `model_te.py`: NVIDIA TransformerEngine variant for CUDA.
 - `data.py`: `.npz` training data loading and symmetry augmentation.
 - `losses.py`: postprocessing, loss, metrics, and FLOPs estimates.
 - `optimizers.py`, `zero.py`: Adam/Muon/Shampoo and ZeRO helpers.
 - `make_smoke_data.py`: tiny synthetic data generator for smoke tests.
 - `train_tpu_colab_smoke.sh`: Colab TPU v6e-1 smoke-test runner.
+- `train_jax.sh`: real-data JAX TPU prototype runner.
 - `TPU_COLAB.md`: Colab setup and TPU test notes.
 
 ## Quick CPU Smoke Test
@@ -88,6 +94,33 @@ environment overrides.
 Available TPU width presets include `b12c512`, `b12c768`, `b12c1024`,
 `b12c1536`, and `b12c2048` for checking whether a wider trunk improves TPU
 utilization over the default `b12c192`.
+
+## JAX TPU Prototype
+
+The JAX path is intended for performance A/B testing after the PyTorch/XLA
+baseline shows low TPU utilization. It currently supports the fixed-board
+real-data path, AdamW, warmup+cosine LR, history matrices, X/Y/T symmetries,
+BF16 matmul/conv compute, `score_mode=simple`, and pickle checkpoints. It does
+not yet implement validation, resume, variable-size board masks, or the
+`mixop` score-belief head.
+
+In a Colab TPU runtime:
+
+```bash
+cd KataGo_Transformer-TPU/nano
+bash colab_install_jax_tpu.sh
+
+MODEL_KIND=b12c2048 \
+BATCH_SIZE=16 \
+MAX_TRAINING_SAMPLES=32768 \
+WARMUP_SAMPLES=4096 \
+TRAINDIR=./jax_tpu_run_b12c2048_b16 \
+bash train_jax.sh
+```
+
+If the stable windows after the first compile land far above the PyTorch/XLA
+run, the next migration step is adding validation/resume and then moving the
+default TPU path over to JAX.
 
 ## CUDA Training Example
 

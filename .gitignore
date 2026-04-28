@@ -16,11 +16,14 @@ data/
 /train/
 /val/
 .tpu_real_data/
+.jax_real_data/
 smoke_data/
 smoke_run/
 tpu_smoke_data/
 tpu_smoke_run/
 tpu_real_run/
+jax_tpu_run/
+jax_tpu_run*/
 *_smoke_data*/
 *_smoke_run*/
 tb_logs/

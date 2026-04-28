@@ -1,6 +1,8 @@
 # TPU v6e-1 Colab Smoke Test
 
-This is the first TPU path for `nano/train.py`. It is intentionally narrow:
+This documents the first TPU paths for `nano/`: the existing PyTorch/XLA
+trainer and a separate JAX/XLA prototype. The PyTorch/XLA path is intentionally
+narrow:
 
 - single-device PyTorch/XLA only (`--device xla`)
 - intended for Colab `v6e-1` smoke testing
@@ -403,6 +405,44 @@ For a full validation pass on all validation rows:
 ```bash
 MAX_VAL_BATCHES=0 bash train.sh
 ```
+
+## JAX TPU Prototype
+
+The PyTorch/XLA sweeps above top out at low single-digit wall-clock MFU even
+after widening the trunk. To separate model math from PyTorch/XLA overhead, the
+repo also includes a direct JAX/XLA training prototype. It keeps the PyTorch
+path intact, uses the same `.npz` data format and model presets, and starts
+with the performance-critical training step only.
+
+Install JAX in a TPU runtime:
+
+```bash
+cd /content/katago-transformer-tpu-nano
+bash colab_install_jax_tpu.sh
+```
+
+Then run the first comparison at the same `b12c2048_b16` scale:
+
+```bash
+MODEL_KIND=b12c2048 \
+BATCH_SIZE=16 \
+MAX_TRAINING_SAMPLES=32768 \
+WARMUP_SAMPLES=4096 \
+PRINT_EVERY=20 \
+TRAINDIR=./jax_tpu_run_b12c2048_b16 \
+bash train_jax.sh
+```
+
+`train_jax.sh` uses `./val` as both `train/` and `val/` when only `./val`
+exists, matching `train.sh` for smoke runs. The prototype currently supports
+fixed-board training, AdamW, warmup+cosine LR, host-side history matrices and
+symmetry augmentation, BF16 matmul/conv compute, `score_mode=simple`, and
+pickle checkpoints. It intentionally does not yet include validation, resume,
+multi-device sharding, variable-board masks, or `score_mode=mixop`.
+
+Judge the run by stable post-compile windows. If JAX removes the repeated
+compile and host-transfer stalls, the next useful step is adding validation and
+resume to `train_jax.py`, then making it the main TPU path.
 
 For reference, the command expanded by `train.sh` is equivalent to:
 
