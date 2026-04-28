@@ -98,6 +98,9 @@ b12c2048 = make_config(12, 2048, 32, ffn_dim=6144)
 b14c2048 = make_config(14, 2048, 32, ffn_dim=6144)
 b16c2048 = make_config(16, 2048, 32, ffn_dim=6144)
 b18c2048 = make_config(18, 2048, 32, ffn_dim=6144)
+b20c2048 = make_config(20, 2048, 32, ffn_dim=6144)
+b22c2048 = make_config(22, 2048, 32, ffn_dim=6144)
+b24c2048 = make_config(24, 2048, 32, ffn_dim=6144)
 b24c1024 = make_config(24, 1024, 16, ffn_dim=3072)
 
 config_of_name = {
@@ -116,5 +119,8 @@ config_of_name = {
     "b14c2048": b14c2048,
     "b16c2048": b16c2048,
     "b18c2048": b18c2048,
+    "b20c2048": b20c2048,
+    "b22c2048": b22c2048,
+    "b24c2048": b24c2048,
     "b24c1024": b24c1024,
 }
