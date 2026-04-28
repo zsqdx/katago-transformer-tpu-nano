@@ -304,8 +304,10 @@ bash train.sh
 ```
 
 The batch-512 `b12c192` run is still too narrow to improve utilization much.
-The next useful sweep is widening the trunk. Start conservatively, then raise
-`BATCH_SIZE` if HBM allows it:
+The next useful sweep is widening the trunk. Current v6e-1 probes show
+`b12c1536` with `BATCH_SIZE=32` as the best practical point so far: about
+26 TFLOPS / 2.9% wall-clock MFU in stable windows. Start conservatively, then
+raise `BATCH_SIZE` if HBM allows it:
 
 ```bash
 MODEL_KIND=b12c512 \
@@ -330,16 +332,35 @@ TRAINDIR=./tpu_real_run_b12c1024_b32 \
 bash train.sh
 
 MODEL_KIND=b12c1536 \
+BATCH_SIZE=32 \
+MAX_TRAINING_SAMPLES=65536 \
+WARMUP_SAMPLES=8192 \
+TRAINDIR=./tpu_real_run_b12c1536_b32 \
+bash train.sh
+
+MODEL_KIND=b12c2048 \
+BATCH_SIZE=8 \
+MAX_TRAINING_SAMPLES=16384 \
+WARMUP_SAMPLES=2048 \
+TRAINDIR=./tpu_real_run_b12c2048_b8 \
+bash train.sh
+```
+
+If `b12c2048_b8` fits comfortably, try:
+
+```bash
+MODEL_KIND=b12c2048 \
 BATCH_SIZE=16 \
 MAX_TRAINING_SAMPLES=32768 \
 WARMUP_SAMPLES=4096 \
-TRAINDIR=./tpu_real_run_b12c1536_b16 \
+TRAINDIR=./tpu_real_run_b12c2048_b16 \
 bash train.sh
 ```
 
 For each width, compare only stable windows after `xla_compile=0.0s/0`. If the
 run fits comfortably, try doubling the batch once. If it runs out of HBM, halve
-the batch.
+the batch. If `b12c2048` does not beat the `b12c1536_b32` stable-window TFLOPS,
+stay with `b12c1536_b32` for v6e-1.
 
 To reduce optimizer/clip overhead per sample without increasing activation
 memory, try gradient accumulation:
