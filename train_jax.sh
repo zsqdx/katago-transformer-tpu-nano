@@ -40,6 +40,9 @@ fi
 if [ "${LOG_GRAD_NORM:-0}" != "0" ]; then
     EXTRA_FLAGS+=(--log-grad-norm)
 fi
+if [ "${LOG_STEP_TIME:-0}" != "0" ]; then
+    EXTRA_FLAGS+=(--log-step-time)
+fi
 if [ "${DONATE_TRAIN_BUFFERS:-0}" != "0" ]; then
     EXTRA_FLAGS+=(--donate-train-buffers)
 fi

@@ -272,6 +272,7 @@ def main():
     parser.add_argument("--opt-update-dtype", type=str, default="float32",
                         choices=["float32", "fp32", "bfloat16", "bf16"])
     parser.add_argument("--log-grad-norm", action="store_true")
+    parser.add_argument("--log-step-time", action="store_true")
     parser.add_argument("--donate-train-buffers", action="store_true")
     parser.add_argument("--stack-blocks", action="store_true")
     parser.add_argument("--scan-blocks", action="store_true")
@@ -512,6 +513,7 @@ def main():
             "pos_len": args.pos_len,
             "optimizer": args.optimizer,
             "loss_profile": args.loss_profile,
+            "log_step_time": args.log_step_time,
             "moving_sum": float(jax.device_get(moving_sum)),
             "moving_weight": float(jax.device_get(moving_weight)),
             "fuse_projections": args.fuse_projections and not args.separate_projections,
@@ -575,12 +577,16 @@ def main():
     def run_training_chunk(batch_list):
         nonlocal params, opt_state, moving_sum, moving_weight
         nonlocal running_metrics, running_grad_norm, step, total_samples
+        chunk_start = time.perf_counter()
+        start_step = step
+        start_samples = total_samples
         batch_count = len(batch_list)
         batch = jax.device_put(stack_batch_list(batch_list))
         lr_wd = [lr_wd_at_step(step + i, args, samples_per_step) for i in range(batch_count)]
         lrs = np.asarray([x[0] for x in lr_wd], dtype=np.float32)
         wds = np.asarray([x[1] for x in lr_wd], dtype=np.float32)
         opt_steps = np.arange(step + 1, step + batch_count + 1, dtype=np.float32)
+        exec_start = time.perf_counter()
         params, opt_state, moving_sum, moving_weight, metrics, grad_norm = train_steps(
             params,
             opt_state,
@@ -591,6 +597,39 @@ def main():
             jnp.asarray(lrs),
             jnp.asarray(wds),
         )
+        if args.log_step_time:
+            metrics.block_until_ready()
+            train_wait_elapsed = time.perf_counter() - exec_start
+            total_elapsed = time.perf_counter() - chunk_start
+            host_submit_elapsed = exec_start - chunk_start
+            samples = args.batch_size * batch_count
+            total_sps = samples / total_elapsed if total_elapsed > 0 else 0.0
+            train_sps = samples / train_wait_elapsed if train_wait_elapsed > 0 else 0.0
+            total_tflops = total_sps * train_flops_per_sample / 1e12
+            train_tflops = train_sps * train_flops_per_sample / 1e12
+            total_mfu = total_tflops / args.xla_peak_tflops * 100.0 if args.xla_peak_tflops > 0 else 0.0
+            train_mfu = train_tflops / args.xla_peak_tflops * 100.0 if args.xla_peak_tflops > 0 else 0.0
+            logging.info(
+                "STEP_TIME steps=%d-%d samples=%d-%d chunk_steps=%d "
+                "host_submit=%.4fs train_wait=%.4fs total=%.4fs "
+                "per_step_total=%.4fs sps_total=%.1f sps_train=%.1f "
+                "TFLOPS_total=%.2f TFLOPS_train=%.2f MFU_total=%.2f%% MFU_train=%.2f%%",
+                start_step + 1,
+                start_step + batch_count,
+                start_samples + args.batch_size,
+                start_samples + samples,
+                batch_count,
+                host_submit_elapsed,
+                train_wait_elapsed,
+                total_elapsed,
+                total_elapsed / batch_count,
+                total_sps,
+                train_sps,
+                total_tflops,
+                train_tflops,
+                total_mfu,
+                train_mfu,
+            )
         running_metrics = running_metrics + metrics
         running_grad_norm = running_grad_norm + grad_norm
         step += batch_count

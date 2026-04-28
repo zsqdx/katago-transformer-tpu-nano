@@ -476,6 +476,10 @@ bash train_jax.sh
 When `GRAD_CLIP_NORM=0`, gradient norm logging is disabled by default to avoid
 an extra full-gradient reduction every step. Set `LOG_GRAD_NORM=1` if you want
 that diagnostic back.
+Set `LOG_STEP_TIME=1` to synchronously log every compiled train call. With the
+default `STEPS_PER_JIT=1`, each `STEP_TIME` line is one optimizer step; with
+larger chunks, `per_step_total` is the chunk average. This mode is for timing
+debugging and intentionally adds synchronization.
 
 For profiling only, you can also test `ACTIVATION_DTYPE=bf16`,
 `PARAM_DTYPE=bf16`, and `OPT_STATE_DTYPE=bf16`. These respectively keep trunk
