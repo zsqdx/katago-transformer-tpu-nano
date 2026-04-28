@@ -515,6 +515,19 @@ but early `b24c1024` profiling showed lower stable throughput than the regular
 Python-unrolled block loop. Set `REMAT_BLOCKS=1` to checkpoint/rematerialize
 each transformer block as a separate activation-memory A/B.
 
+To quickly search for a better single-chip TPU shape, run:
+
+```bash
+bash sweep_jax_shapes.sh
+```
+
+The sweep uses short full-BF16 JAX training windows and writes sorted results
+to `jax_shape_sweep_*/summary.tsv`. Override the candidate list with
+`SWEEP_SPECS="b8c2048:32 b12c2048:16"`; each entry is `MODEL_KIND:BATCH_SIZE`.
+Set `SWEEP_COMPONENT_PROFILE=1` to also run the component microprofile for
+each candidate. The sweep disables final checkpoint saves to keep the search
+fast and disk-light.
+
 For reference, the command expanded by `train.sh` is equivalent to:
 
 ```bash

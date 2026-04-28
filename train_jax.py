@@ -295,6 +295,7 @@ def main():
     parser.add_argument("--enable-history-matrices", action="store_true")
     parser.add_argument("--allow-nonfull-mask", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--no-final-save", action="store_true")
     parser.add_argument("--separate-projections", action="store_true")
     parser.add_argument("--fuse-projections", action="store_true")
     parser.add_argument("--attention-impl", type=str, default="manual", choices=["manual", "xla"])
@@ -1107,9 +1108,11 @@ def main():
         if not shuffled:
             break
 
-    if total_samples > last_save_samples:
+    if not args.no_final_save and total_samples > last_save_samples:
         save_checkpoint(checkpoint_path, params, opt_state, checkpoint_meta())
         logging.info("Saved checkpoint at step %d, %d samples", step, total_samples)
+    elif args.no_final_save and total_samples > last_save_samples:
+        logging.info("Final checkpoint skipped by --no-final-save")
     logging.info("Training complete: %d samples, %d steps", total_samples, step)
 
 

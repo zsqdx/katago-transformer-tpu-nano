@@ -92,8 +92,9 @@ experiments, `train.sh` also exposes `GRAD_ACCUM_STEPS` and `GRAD_CLIP_NORM`
 environment overrides.
 
 Available TPU width presets include `b12c512`, `b12c768`, `b12c1024`,
-`b12c1536`, and `b12c2048` for checking whether a wider trunk improves TPU
-utilization over the default `b12c192`.
+`b12c1536`, `b12c1792`, `b12c2048`, `b8c2048`, `b16c1536`, `b16c2048`, and
+`b24c1024` for checking whether a wider trunk improves TPU utilization over
+the default `b12c192`.
 
 ## JAX TPU Prototype
 
@@ -181,6 +182,19 @@ but early `b24c1024` TPU profiling showed lower stable throughput than the
 unscanned loop. Set `REMAT_BLOCKS=1` to checkpoint/rematerialize each
 transformer block, which trades extra recomputation for lower activation memory
 pressure and is intended as a separate throughput A/B.
+
+To quickly search for a better single-chip TPU shape, run:
+
+```bash
+bash sweep_jax_shapes.sh
+```
+
+The sweep uses short full-BF16 JAX training windows and writes sorted results
+to `jax_shape_sweep_*/summary.tsv`. Override the candidate list with
+`SWEEP_SPECS="b8c2048:32 b12c2048:16"`; each entry is `MODEL_KIND:BATCH_SIZE`.
+Set `SWEEP_COMPONENT_PROFILE=1` to also run the component microprofile for
+each candidate. The sweep disables final checkpoint saves to keep the search
+fast and disk-light.
 
 ## CUDA Training Example
 

@@ -31,6 +31,9 @@ fi
 if [ "${NO_RESUME:-0}" != "0" ]; then
     EXTRA_FLAGS+=(--no-resume)
 fi
+if [ "${NO_FINAL_SAVE:-0}" != "0" ]; then
+    EXTRA_FLAGS+=(--no-final-save)
+fi
 if [ "${SEPARATE_PROJECTIONS:-0}" != "0" ]; then
     EXTRA_FLAGS+=(--separate-projections)
 fi

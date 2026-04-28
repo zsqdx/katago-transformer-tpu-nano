@@ -90,7 +90,11 @@ b24c512 = make_config(24, 512, 8, ffn_dim=1536)
 # ~330M params — ViT-L
 b12c1024 = make_config(12, 1024, 16, ffn_dim=3072)
 b12c1536 = make_config(12, 1536, 24, ffn_dim=4096)
+b16c1536 = make_config(16, 1536, 24, ffn_dim=4096)
+b12c1792 = make_config(12, 1792, 28, ffn_dim=5120)
+b8c2048 = make_config(8, 2048, 32, ffn_dim=6144)
 b12c2048 = make_config(12, 2048, 32, ffn_dim=6144)
+b16c2048 = make_config(16, 2048, 32, ffn_dim=6144)
 b24c1024 = make_config(24, 1024, 16, ffn_dim=3072)
 
 config_of_name = {
@@ -101,6 +105,10 @@ config_of_name = {
     "b12c768": b12c768,
     "b12c1024": b12c1024,
     "b12c1536": b12c1536,
+    "b16c1536": b16c1536,
+    "b12c1792": b12c1792,
+    "b8c2048": b8c2048,
     "b12c2048": b12c2048,
+    "b16c2048": b16c2048,
     "b24c1024": b24c1024,
 }
