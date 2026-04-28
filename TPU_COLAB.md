@@ -515,6 +515,10 @@ full-matrix Muon on the wide FFN weights can dominate wall time. Set
 `MUON_ROW_SPLIT_SIZE=256` to split large block matrices into row chunks before
 the polar iteration; compare `128`, `256`, and `512` for throughput and loss
 behavior.
+Muon normally uses one train-step JIT so gradients stay inside the compiled
+program. If a larger Muon shape stalls during compilation, set
+`MUON_SPLIT_JIT=1` as a slower fallback that compiles loss/grad and optimizer
+update separately.
 Set `OPTIMIZER=none` or `OPTIMIZER=sgd` only for profiling optimizer overhead:
 `none` skips parameter updates and may let XLA eliminate unused backward work,
 so treat it as a forward/loss lower-bound probe; `sgd` keeps gradients live

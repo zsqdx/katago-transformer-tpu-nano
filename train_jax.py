@@ -615,6 +615,7 @@ def main():
     parser.add_argument("--component-profile-repeats", type=int, default=3)
     parser.add_argument("--component-profile-grad", action="store_true")
     parser.add_argument("--donate-train-buffers", action="store_true")
+    parser.add_argument("--muon-split-jit", action="store_true")
     parser.add_argument("--stack-blocks", action="store_true")
     parser.add_argument("--scan-blocks", action="store_true")
     parser.add_argument("--remat-blocks", action="store_true")
@@ -918,6 +919,15 @@ def main():
             muon_update_flops / 1e12,
             args.muon_row_split_size,
         )
+        if args.muon_split_jit:
+            logging.info(
+                "Muon split-JIT fallback is enabled: loss/grad and optimizer update compile separately. "
+                "This can avoid oversized HLOs, but it materializes gradients between programs and is slower."
+            )
+        else:
+            logging.info(
+                "Muon uses the single train-step JIT path. If compilation stalls, retry with MUON_SPLIT_JIT=1."
+            )
     component_flops = estimate_forward_component_flops(model_config, args.pos_len, args.score_mode)
 
     def block_until_ready(value):
@@ -1313,6 +1323,7 @@ def main():
             "muon_lr_multiplier": args.muon_lr_multiplier,
             "muon_momentum": args.muon_momentum,
             "muon_row_split_size": args.muon_row_split_size,
+            "muon_split_jit": args.muon_split_jit,
             "loss_profile": args.loss_profile,
             "log_step_time": args.log_step_time,
             "moving_sum": float(jax.device_get(moving_sum)),
@@ -1391,7 +1402,7 @@ def main():
         wds = np.asarray([x[1] for x in lr_wd], dtype=np.float32)
         opt_steps = np.arange(step + 1, step + batch_count + 1, dtype=np.float32)
         exec_start = time.perf_counter()
-        if args.optimizer == "muon":
+        if args.optimizer == "muon" and args.muon_split_jit:
             if step == 0:
                 logging.info(
                     "Muon uses split JIT execution: compiling loss/grad and optimizer update separately. "

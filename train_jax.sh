@@ -55,6 +55,9 @@ fi
 if [ "${DONATE_TRAIN_BUFFERS:-0}" != "0" ]; then
     EXTRA_FLAGS+=(--donate-train-buffers)
 fi
+if [ "${MUON_SPLIT_JIT:-0}" != "0" ]; then
+    EXTRA_FLAGS+=(--muon-split-jit)
+fi
 if [ "${STACK_BLOCKS:-0}" != "0" ]; then
     EXTRA_FLAGS+=(--stack-blocks)
 fi

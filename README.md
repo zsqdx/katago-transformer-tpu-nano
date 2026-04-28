@@ -183,6 +183,10 @@ Muon's optimizer work is not included in the standard model-FLOPs MFU log, and
 full-matrix Muon on wide FFN weights can dominate wall time. Set
 `MUON_ROW_SPLIT_SIZE=256` to split large block matrices into row chunks before
 the polar iteration; try `128`, `256`, and `512` as TPU throughput/quality A/Bs.
+Muon normally compiles as one train-step JIT so XLA can keep gradients inside
+the compiled program. If that compile stalls on a larger shape, set
+`MUON_SPLIT_JIT=1` as a slower fallback that compiles loss/grad and optimizer
+update separately.
 Set `OPTIMIZER=none` or `OPTIMIZER=sgd` only for profiling optimizer overhead:
 `none` skips parameter updates and may let XLA eliminate unused backward work,
 so treat it as a forward/loss lower-bound probe; `sgd` keeps gradients live
