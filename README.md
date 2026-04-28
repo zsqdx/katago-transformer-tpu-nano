@@ -164,6 +164,11 @@ ops, `PARAM_DTYPE=bf16` stores trainable parameters in BF16, and
 `OPT_UPDATE_DTYPE=bf16` also runs the AdamW update math in BF16, which is a
 more aggressive optimizer-throughput A/B. All default to `float32` until their
 training impact is measured.
+More granular BF16 probes are available for the current TPU bottlenecks:
+`ROPE_DTYPE=bf16` computes RoPE rotations in BF16, `FFN_MUL_DTYPE=bf16` keeps
+the SwiGLU gate product in BF16, and `ATTENTION_LOGITS_DTYPE=bf16` runs the
+manual-attention softmax logits in BF16. These are profiling switches because
+they can affect numerical behavior.
 Set `OPTIMIZER=none` or `OPTIMIZER=sgd` only for profiling optimizer overhead:
 `none` skips parameter updates and may let XLA eliminate unused backward work,
 so treat it as a forward/loss lower-bound probe; `sgd` keeps gradients live
@@ -171,9 +176,10 @@ with a minimal weight-decayed SGD update.
 Set `LOSS_PROFILE=policy_value`, `policy_only`, or `value_only` only for
 profiling loss/head overhead. These modes deliberately drop auxiliary losses
 and let XLA eliminate unused heads, so they are not training-equivalent.
-Set `DONATE_TRAIN_BUFFERS=1` to let JAX donate the parameter buffers across
-each compiled train call; this may reduce memory pressure, but it is kept
-opt-in because broader donation can expose buffer-aliasing issues.
+Set `DONATE_TRAIN_BUFFERS=1` to let JAX donate parameter buffers across each
+compiled train call; for AdamW this also donates the optimizer-state buffers.
+This may reduce memory pressure, but it is kept opt-in because broader donation
+can expose buffer-aliasing issues.
 Set `STACK_BLOCKS=1` to store all transformer block parameters as stacked layer
 arrays while still unrolling the block loop; this isolates the optimizer/tree
 layout effect from the slower `lax.scan` execution path.

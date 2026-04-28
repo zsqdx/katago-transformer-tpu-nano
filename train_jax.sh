@@ -97,6 +97,9 @@ python -u train_jax.py \
     --param-dtype "${PARAM_DTYPE:-float32}" \
     --opt-state-dtype "${OPT_STATE_DTYPE:-float32}" \
     --opt-update-dtype "${OPT_UPDATE_DTYPE:-float32}" \
+    --rope-dtype "${ROPE_DTYPE:-float32}" \
+    --ffn-mul-dtype "${FFN_MUL_DTYPE:-float32}" \
+    --attention-logits-dtype "${ATTENTION_LOGITS_DTYPE:-float32}" \
     --xla-peak-tflops "${XLA_PEAK_TFLOPS:-918}" \
     --allow-nonfull-mask \
     --seed "${SEED:-1234}" \

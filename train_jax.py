@@ -67,8 +67,10 @@ def init_adam_state(params, dtype=None):
     import jax.numpy as jnp
 
     state_dtype = jnp.float32 if dtype is None else dtype
-    zeros = _tree_map(lambda p: jnp.zeros(p.shape, dtype=state_dtype), params)
-    return {"m": zeros, "v": zeros}
+    return {
+        "m": _tree_map(lambda p: jnp.zeros(p.shape, dtype=state_dtype), params),
+        "v": _tree_map(lambda p: jnp.zeros(p.shape, dtype=state_dtype), params),
+    }
 
 
 def adamw_update(
@@ -307,6 +309,12 @@ def main():
                         choices=["float32", "fp32", "bfloat16", "bf16"])
     parser.add_argument("--opt-update-dtype", type=str, default="float32",
                         choices=["float32", "fp32", "bfloat16", "bf16"])
+    parser.add_argument("--rope-dtype", type=str, default="float32",
+                        choices=["float32", "fp32", "bfloat16", "bf16"])
+    parser.add_argument("--ffn-mul-dtype", type=str, default="float32",
+                        choices=["float32", "fp32", "bfloat16", "bf16"])
+    parser.add_argument("--attention-logits-dtype", type=str, default="float32",
+                        choices=["float32", "fp32", "bfloat16", "bf16"])
     parser.add_argument("--log-grad-norm", action="store_true")
     parser.add_argument("--log-step-time", action="store_true")
     parser.add_argument("--component-profile", action="store_true")
@@ -347,6 +355,9 @@ def main():
     param_dtype = jax_model.dtype_from_name(args.param_dtype)
     opt_state_dtype = jax_model.dtype_from_name(args.opt_state_dtype)
     opt_update_dtype = jax_model.dtype_from_name(args.opt_update_dtype)
+    rope_dtype = jax_model.dtype_from_name(args.rope_dtype)
+    ffn_mul_dtype = jax_model.dtype_from_name(args.ffn_mul_dtype)
+    attention_logits_dtype = jax_model.dtype_from_name(args.attention_logits_dtype)
 
     os.makedirs(args.traindir, exist_ok=True)
     logging.basicConfig(
@@ -417,7 +428,10 @@ def main():
                                     attention_impl=args.attention_impl,
                                     activation_dtype=activation_dtype,
                                     remat_blocks=args.remat_blocks,
-                                    scan_blocks=args.scan_blocks)
+                                    scan_blocks=args.scan_blocks,
+                                    rope_dtype=rope_dtype,
+                                    ffn_mul_dtype=ffn_mul_dtype,
+                                    attention_logits_dtype=attention_logits_dtype)
         if args.loss_profile != "full":
             return jax_losses.profile_loss_core(
                 outputs,
@@ -510,10 +524,11 @@ def main():
             jnp.sum(grad_norm_seq),
         )
 
-    train_steps = jax.jit(
-        train_steps_impl,
-        donate_argnums=(0,) if args.donate_train_buffers else (),
-    )
+    if args.donate_train_buffers:
+        train_donate_argnums = (0, 1) if args.optimizer == "adamw" else (0,)
+    else:
+        train_donate_argnums = ()
+    train_steps = jax.jit(train_steps_impl, donate_argnums=train_donate_argnums)
 
     @jax.jit
     def eval_step(params_, batch_, moving_sum_, moving_weight_):
@@ -659,7 +674,7 @@ def main():
         )
         q, k = time_component(
             "block0_rope",
-            lambda q_i, k_i: jax_model.apply_rope(q_i, k_i, rope_cos, rope_sin),
+            lambda q_i, k_i: jax_model.apply_rope(q_i, k_i, rope_cos, rope_sin, compute_dtype=rope_dtype),
             q,
             k,
         )
@@ -672,6 +687,7 @@ def main():
                 v_i,
                 attention_impl=args.attention_impl,
                 out_dtype=activation_dtype,
+                logits_dtype=attention_logits_dtype,
             ).reshape(bsz, seq_len, heads * head_dim)
 
         attn_out = time_component(
@@ -707,7 +723,7 @@ def main():
             else:
                 w1 = jax_model.silu(jax_model.linear(block_i["ffn_w1"], x_norm_i, out_dtype=activation_dtype))
                 wg = jax_model.linear(block_i["ffn_wgate"], x_norm_i, out_dtype=activation_dtype)
-            return (w1.astype(jnp.float32) * wg.astype(jnp.float32)).astype(activation_dtype)
+            return (w1.astype(ffn_mul_dtype) * wg.astype(ffn_mul_dtype)).astype(activation_dtype)
 
         hidden = time_component(
             "block0_ffn_upgate",
@@ -736,6 +752,9 @@ def main():
                 num_heads,
                 attention_impl=args.attention_impl,
                 activation_dtype=activation_dtype,
+                rope_dtype=rope_dtype,
+                ffn_mul_dtype=ffn_mul_dtype,
+                attention_logits_dtype=attention_logits_dtype,
             ),
             block0,
             x_stem,
@@ -752,6 +771,9 @@ def main():
                 activation_dtype=activation_dtype,
                 remat_blocks=args.remat_blocks,
                 scan_blocks=args.scan_blocks,
+                rope_dtype=rope_dtype,
+                ffn_mul_dtype=ffn_mul_dtype,
+                attention_logits_dtype=attention_logits_dtype,
             ),
             params,
             x_stem,
@@ -777,6 +799,9 @@ def main():
                 activation_dtype=activation_dtype,
                 remat_blocks=args.remat_blocks,
                 scan_blocks=args.scan_blocks,
+                rope_dtype=rope_dtype,
+                ffn_mul_dtype=ffn_mul_dtype,
+                attention_logits_dtype=attention_logits_dtype,
             ),
             params,
             batch,
@@ -906,6 +931,10 @@ def main():
             "param_dtype": args.param_dtype,
             "opt_state_dtype": args.opt_state_dtype,
             "opt_update_dtype": args.opt_update_dtype,
+            "rope_dtype": args.rope_dtype,
+            "ffn_mul_dtype": args.ffn_mul_dtype,
+            "attention_logits_dtype": args.attention_logits_dtype,
+            "donate_train_buffers": args.donate_train_buffers,
             "stack_blocks": args.stack_blocks or args.scan_blocks,
             "scan_blocks": args.scan_blocks,
             "remat_blocks": args.remat_blocks,

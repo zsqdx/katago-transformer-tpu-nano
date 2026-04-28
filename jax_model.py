@@ -114,18 +114,29 @@ def rotate_half(x):
     return jnp.concatenate([-b, a], axis=-1)
 
 
-def apply_rope(q, k, cos, sin):
+def apply_rope(q, k, cos, sin, compute_dtype=jnp.float32):
     cos = cos.reshape((1, q.shape[1], -1, q.shape[-1]))
     sin = sin.reshape((1, q.shape[1], -1, q.shape[-1]))
-    qf = q.astype(jnp.float32)
-    kf = k.astype(jnp.float32)
+    half = q.shape[-1] // 2
+    cos = cos[..., :half].astype(compute_dtype)
+    sin = sin[..., :half].astype(compute_dtype)
+    q0, q1 = jnp.split(q.astype(compute_dtype), 2, axis=-1)
+    k0, k1 = jnp.split(k.astype(compute_dtype), 2, axis=-1)
     return (
-        (qf * cos + rotate_half(qf) * sin).astype(q.dtype),
-        (kf * cos + rotate_half(kf) * sin).astype(k.dtype),
+        jnp.concatenate([q0 * cos - q1 * sin, q1 * cos + q0 * sin], axis=-1).astype(q.dtype),
+        jnp.concatenate([k0 * cos - k1 * sin, k1 * cos + k0 * sin], axis=-1).astype(k.dtype),
     )
 
 
-def attention(q, k, v, mask=None, attention_impl="manual", out_dtype=jnp.float32):
+def attention(
+    q,
+    k,
+    v,
+    mask=None,
+    attention_impl="manual",
+    out_dtype=jnp.float32,
+    logits_dtype=jnp.float32,
+):
     # q,k,v: B,L,H,D
     if attention_impl == "xla":
         if mask is not None:
@@ -146,9 +157,9 @@ def attention(q, k, v, mask=None, attention_impl="manual", out_dtype=jnp.float32
         "bhld,bhmd->bhlm",
         q.astype(COMPUTE_DTYPE),
         k.astype(COMPUTE_DTYPE),
-    ).astype(jnp.float32) * scale
+    ).astype(logits_dtype) * jnp.asarray(scale, dtype=logits_dtype)
     if mask is not None:
-        logits = logits + mask
+        logits = logits + mask.astype(logits_dtype)
     weights = jax.nn.softmax(logits, axis=-1).astype(COMPUTE_DTYPE)
     out = jnp.einsum("bhlm,bhmd->bhld", weights, v.astype(COMPUTE_DTYPE)).astype(out_dtype)
     return jnp.transpose(out, (0, 2, 1, 3))
@@ -226,6 +237,9 @@ def transformer_block(
     num_heads,
     attention_impl="manual",
     activation_dtype=jnp.float32,
+    rope_dtype=jnp.float32,
+    ffn_mul_dtype=jnp.float32,
+    attention_logits_dtype=jnp.float32,
 ):
     bsz, seq_len, channels = x.shape
     head_dim = channels // num_heads
@@ -244,7 +258,7 @@ def transformer_block(
         k = k.reshape(bsz, seq_len, num_heads, head_dim)
         v = v.reshape(bsz, seq_len, num_heads, head_dim)
     with jax.named_scope("attn_rope"):
-        q, k = apply_rope(q, k, rope_cos, rope_sin)
+        q, k = apply_rope(q, k, rope_cos, rope_sin, compute_dtype=rope_dtype)
     with jax.named_scope("attention"):
         attn_out = attention(
             q,
@@ -252,6 +266,7 @@ def transformer_block(
             v,
             attention_impl=attention_impl,
             out_dtype=activation_dtype,
+            logits_dtype=attention_logits_dtype,
         ).reshape(bsz, seq_len, channels)
     with jax.named_scope("attn_out_proj"):
         x = (x + linear(params["out_proj"], attn_out, out_dtype=activation_dtype)).astype(activation_dtype)
@@ -266,7 +281,7 @@ def transformer_block(
         else:
             w1 = silu(linear(params["ffn_w1"], x_norm, out_dtype=activation_dtype))
             wg = linear(params["ffn_wgate"], x_norm, out_dtype=activation_dtype)
-        hidden = (w1.astype(jnp.float32) * wg.astype(jnp.float32)).astype(activation_dtype)
+        hidden = (w1.astype(ffn_mul_dtype) * wg.astype(ffn_mul_dtype)).astype(activation_dtype)
     with jax.named_scope("ffn_down"):
         return (x + linear(params["ffn_w2"], hidden, out_dtype=activation_dtype)).astype(activation_dtype)
 
@@ -299,6 +314,9 @@ def forward_trunk(
     activation_dtype=jnp.float32,
     remat_blocks=False,
     scan_blocks=False,
+    rope_dtype=jnp.float32,
+    ffn_mul_dtype=jnp.float32,
+    attention_logits_dtype=jnp.float32,
 ):
     num_heads = config["num_heads"]
 
@@ -313,6 +331,9 @@ def forward_trunk(
             num_heads,
             attention_impl=attention_impl,
             activation_dtype=activation_dtype,
+            rope_dtype=rope_dtype,
+            ffn_mul_dtype=ffn_mul_dtype,
+            attention_logits_dtype=attention_logits_dtype,
         )
 
     if remat_blocks:
@@ -372,6 +393,9 @@ def forward(
     activation_dtype=jnp.float32,
     remat_blocks=False,
     scan_blocks=False,
+    rope_dtype=jnp.float32,
+    ffn_mul_dtype=jnp.float32,
+    attention_logits_dtype=jnp.float32,
 ):
     x = forward_stem(params, binary_input, global_input, config, pos_len, activation_dtype)
     x = forward_trunk(
@@ -383,6 +407,9 @@ def forward(
         activation_dtype=activation_dtype,
         remat_blocks=remat_blocks,
         scan_blocks=scan_blocks,
+        rope_dtype=rope_dtype,
+        ffn_mul_dtype=ffn_mul_dtype,
+        attention_logits_dtype=attention_logits_dtype,
     )
     with jax.named_scope("heads"):
         return forward_heads(params, x, pos_len)
