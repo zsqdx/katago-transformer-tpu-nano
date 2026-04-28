@@ -159,6 +159,11 @@ def save_checkpoint(path, params, opt_state, meta):
     os.replace(tmp_path, path)
 
 
+def load_checkpoint(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
 def main():
     global jax_losses, jax_model
 
@@ -176,9 +181,12 @@ def main():
     parser.add_argument("--warmup-samples", type=int, default=4096)
     parser.add_argument("--print-every", type=int, default=20)
     parser.add_argument("--save-every-samples", type=int, default=0)
+    parser.add_argument("--val-every-samples", type=int, default=0)
+    parser.add_argument("--max-val-batches", type=int, default=16)
     parser.add_argument("--symmetry-type", type=str, default="xyt")
     parser.add_argument("--enable-history-matrices", action="store_true")
     parser.add_argument("--allow-nonfull-mask", action="store_true")
+    parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--init-std", type=float, default=0.02)
     parser.add_argument("--score-mode", type=str, default="simple", choices=["simple"])
@@ -218,19 +226,46 @@ def main():
     model_config = configs.config_of_name[args.model_kind]
     logging.info("Model config: %s", json.dumps(model_config, indent=2))
 
-    key = jax.random.PRNGKey(args.seed)
-    params = jax_model.init_params(key, model_config, args.pos_len, init_std=args.init_std, score_mode=args.score_mode)
-    params = jax.device_put(params)
-    opt_state = jax.device_put(init_adam_state(params))
     rope_cache = tuple(jax.device_put(x) for x in jax_model.precompute_rope(
         model_config["hidden_size"] // model_config["num_heads"], args.pos_len
     ))
     score_offsets = jax.device_put(jax_model.score_belief_offsets(args.pos_len))
+    checkpoint_path = os.path.join(args.traindir, "checkpoint_jax.pkl")
+
     moving_sum = jnp.asarray(0.0, dtype=jnp.float32)
     moving_weight = jnp.asarray(0.0, dtype=jnp.float32)
+    total_samples = 0
+    step = 0
+
+    if not args.no_resume and os.path.exists(checkpoint_path):
+        state = load_checkpoint(checkpoint_path)
+        meta = state.get("meta", {})
+        if meta.get("model_config") != model_config:
+            raise ValueError(f"{checkpoint_path}: checkpoint model_config does not match {args.model_kind}")
+        if int(meta.get("pos_len", args.pos_len)) != args.pos_len:
+            raise ValueError(f"{checkpoint_path}: checkpoint pos_len does not match {args.pos_len}")
+        params = jax.device_put(state["params"])
+        opt_state = jax.device_put(state["opt_state"])
+        step = int(meta.get("step", 0))
+        total_samples = int(meta.get("samples", 0))
+        moving_sum = jnp.asarray(float(meta.get("moving_sum", 0.0)), dtype=jnp.float32)
+        moving_weight = jnp.asarray(float(meta.get("moving_weight", 0.0)), dtype=jnp.float32)
+        logging.info("Resumed checkpoint at step %d, %d samples", step, total_samples)
+    else:
+        key = jax.random.PRNGKey(args.seed)
+        params = jax_model.init_params(
+            key,
+            model_config,
+            args.pos_len,
+            init_std=args.init_std,
+            score_mode=args.score_mode,
+        )
+        params = jax.device_put(params)
+        opt_state = jax.device_put(init_adam_state(params))
+
     td_value_loss_scales = (0.6, 0.6, 0.6)
 
-    def loss_fn(params_, batch_, moving_sum_, moving_weight_):
+    def loss_fn(params_, batch_, moving_sum_, moving_weight_, is_training):
         outputs = jax_model.forward(params_, batch_["binaryInputNCHW"], batch_["globalInputNC"],
                                     model_config, args.pos_len, rope_cache)
         return jax_losses.postprocess_and_loss_core(
@@ -243,14 +278,16 @@ def main():
             args.pos_len,
             moving_sum_,
             moving_weight_,
-            is_training=True,
+            is_training=is_training,
             td_value_loss_scales=td_value_loss_scales,
         )
 
     @jax.jit
     def train_step(params_, opt_state_, batch_, moving_sum_, moving_weight_, opt_step, lr, wd):
         def scalar_loss(p):
-            loss, metrics, new_moving_sum, new_moving_weight = loss_fn(p, batch_, moving_sum_, moving_weight_)
+            loss, metrics, new_moving_sum, new_moving_weight = loss_fn(
+                p, batch_, moving_sum_, moving_weight_, True
+            )
             return loss, (metrics, new_moving_sum, new_moving_weight)
 
         (loss, (metrics, new_moving_sum, new_moving_weight)), grads = jax.value_and_grad(
@@ -263,10 +300,18 @@ def main():
         new_params, new_opt_state = adamw_update(params_, grads, opt_state_, opt_step, lr, wd)
         return new_params, new_opt_state, new_moving_sum, new_moving_weight, metrics, grad_norm
 
+    @jax.jit
+    def eval_step(params_, batch_, moving_sum_, moving_weight_):
+        _, metrics, _, _ = loss_fn(params_, batch_, moving_sum_, moving_weight_, False)
+        return metrics
+
     train_files = jax_data.list_npz_files(args.datadir, "train")
     if not train_files:
         raise RuntimeError(f"No training files found in {os.path.join(args.datadir, 'train')}")
     logging.info("Training files: %d", len(train_files))
+
+    val_files = jax_data.list_npz_files(args.datadir, "val")
+    logging.info("Validation files: %d", len(val_files))
 
     samples_per_step = args.batch_size
     forward_flops = estimate_forward_flops(model_config, args.pos_len, args.score_mode)
@@ -277,13 +322,70 @@ def main():
         train_flops_per_sample / 1e9,
     )
 
-    total_samples = 0
-    step = 0
     running_metrics = jnp.zeros((len(jax_losses.METRIC_KEYS),), dtype=jnp.float32)
     running_grad_norm = jnp.asarray(0.0, dtype=jnp.float32)
     last_print_time = time.perf_counter()
     save_every = args.save_every_samples or args.max_training_samples
-    last_save_samples = 0
+    val_every = args.val_every_samples or args.max_training_samples
+    last_save_samples = total_samples
+    last_val_samples = total_samples
+
+    def checkpoint_meta():
+        return {
+            "step": step,
+            "samples": total_samples,
+            "model_config": model_config,
+            "pos_len": args.pos_len,
+            "moving_sum": float(jax.device_get(moving_sum)),
+            "moving_weight": float(jax.device_get(moving_weight)),
+        }
+
+    def log_metric_summary(prefix, samples, metrics_host, batch_count):
+        weight_sum = max(float(metrics_host[-1]), 1e-10)
+        by_key = dict(zip(jax_losses.METRIC_KEYS, metrics_host.tolist()))
+        logging.info(
+            "%s [%d samples]: loss=%.4f, p0loss=%.4f, vloss=%.4f, "
+            "oloss=%.4f, skloss=%.4f, pacc1=%.4f",
+            prefix,
+            samples,
+            by_key["loss"] / max(batch_count, 1),
+            by_key["p0loss"] / weight_sum,
+            by_key["vloss"] / weight_sum,
+            by_key["oloss"] / weight_sum,
+            by_key["skloss"] / weight_sum,
+            by_key["pacc1"] / weight_sum,
+        )
+
+    def run_validation():
+        if not val_files:
+            logging.warning("  VAL skipped: no validation files found")
+            return
+        if args.max_val_batches > 0:
+            logging.info("  VAL limited to %d batches", args.max_val_batches)
+
+        val_metrics = jnp.zeros((len(jax_losses.METRIC_KEYS),), dtype=jnp.float32)
+        val_count = 0
+        for val_batch_idx, batch_np in enumerate(jax_data.read_npz_batches(
+            val_files,
+            args.batch_size,
+            args.pos_len,
+            model_config,
+            symmetry_type="none",
+            enable_history_matrices=args.enable_history_matrices,
+            seed=args.seed + total_samples + 999983,
+            allow_nonfull_mask=args.allow_nonfull_mask,
+        )):
+            if args.max_val_batches > 0 and val_batch_idx >= args.max_val_batches:
+                break
+            batch = jax.device_put(batch_np)
+            val_metrics = val_metrics + eval_step(params, batch, moving_sum, moving_weight)
+            val_count += 1
+
+        if val_count == 0:
+            logging.warning("  VAL skipped: no full validation batches")
+            return
+        metrics_host = jax.device_get(val_metrics)
+        log_metric_summary("  VAL", total_samples, metrics_host, val_count)
 
     while total_samples < args.max_training_samples:
         rand = np.random.default_rng(args.seed + step)
@@ -352,31 +454,23 @@ def main():
                 last_print_time = time.perf_counter()
 
             if total_samples - last_save_samples >= save_every:
-                ckpt = os.path.join(args.traindir, "checkpoint_jax.pkl")
-                save_checkpoint(ckpt, params, opt_state, {
-                    "step": step,
-                    "samples": total_samples,
-                    "model_config": model_config,
-                    "pos_len": args.pos_len,
-                    "moving_sum": float(jax.device_get(moving_sum)),
-                    "moving_weight": float(jax.device_get(moving_weight)),
-                })
+                save_start = time.perf_counter()
+                save_checkpoint(checkpoint_path, params, opt_state, checkpoint_meta())
                 logging.info("Saved checkpoint at step %d, %d samples", step, total_samples)
+                last_print_time += time.perf_counter() - save_start
                 last_save_samples = total_samples
+
+            if total_samples - last_val_samples >= val_every:
+                val_start = time.perf_counter()
+                run_validation()
+                last_print_time += time.perf_counter() - val_start
+                last_val_samples = total_samples
 
         if not shuffled:
             break
 
     if total_samples > last_save_samples:
-        ckpt = os.path.join(args.traindir, "checkpoint_jax.pkl")
-        save_checkpoint(ckpt, params, opt_state, {
-            "step": step,
-            "samples": total_samples,
-            "model_config": model_config,
-            "pos_len": args.pos_len,
-            "moving_sum": float(jax.device_get(moving_sum)),
-            "moving_weight": float(jax.device_get(moving_weight)),
-        })
+        save_checkpoint(checkpoint_path, params, opt_state, checkpoint_meta())
         logging.info("Saved checkpoint at step %d, %d samples", step, total_samples)
     logging.info("Training complete: %d samples, %d steps", total_samples, step)
 

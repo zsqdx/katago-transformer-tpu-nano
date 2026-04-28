@@ -436,13 +436,14 @@ bash train_jax.sh
 `train_jax.sh` uses `./val` as both `train/` and `val/` when only `./val`
 exists, matching `train.sh` for smoke runs. The prototype currently supports
 fixed-board training, AdamW, warmup+cosine LR, host-side history matrices and
-symmetry augmentation, BF16 matmul/conv compute, `score_mode=simple`, and
-pickle checkpoints. It intentionally does not yet include validation, resume,
-multi-device sharding, variable-board masks, or `score_mode=mixop`.
+symmetry augmentation, BF16 matmul/conv compute, `score_mode=simple`,
+validation, automatic resume, and pickle checkpoints. It intentionally does
+not yet include multi-device sharding, variable-board masks, or
+`score_mode=mixop`.
 
 Judge the run by stable post-compile windows. If JAX removes the repeated
-compile and host-transfer stalls, the next useful step is adding validation and
-resume to `train_jax.py`, then making it the main TPU path.
+compile and host-transfer stalls, the next useful step is making it the main
+TPU path and filling in the remaining feature gaps.
 
 For reference, the command expanded by `train.sh` is equivalent to:
 

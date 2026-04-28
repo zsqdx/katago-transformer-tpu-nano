@@ -28,9 +28,13 @@ EXTRA_FLAGS=()
 if [ "${ENABLE_HISTORY_MATRICES:-1}" != "0" ]; then
     EXTRA_FLAGS+=(--enable-history-matrices)
 fi
+if [ "${NO_RESUME:-0}" != "0" ]; then
+    EXTRA_FLAGS+=(--no-resume)
+fi
 
 MAX_TRAINING_SAMPLES_VALUE="${MAX_TRAINING_SAMPLES:-32768}"
 SAVE_EVERY_SAMPLES_VALUE="${SAVE_EVERY_SAMPLES:-${MAX_TRAINING_SAMPLES_VALUE}}"
+VAL_EVERY_SAMPLES_VALUE="${VAL_EVERY_SAMPLES:-${MAX_TRAINING_SAMPLES_VALUE}}"
 WARMUP_SAMPLES_VALUE="${WARMUP_SAMPLES:-4096}"
 
 python -u train_jax.py \
@@ -47,6 +51,8 @@ python -u train_jax.py \
     --warmup-samples "${WARMUP_SAMPLES_VALUE}" \
     --print-every "${PRINT_EVERY:-20}" \
     --save-every-samples "${SAVE_EVERY_SAMPLES_VALUE}" \
+    --val-every-samples "${VAL_EVERY_SAMPLES_VALUE}" \
+    --max-val-batches "${MAX_VAL_BATCHES:-16}" \
     --symmetry-type "${SYMMETRY_TYPE:-xyt}" \
     --score-mode "${SCORE_MODE:-simple}" \
     --xla-peak-tflops "${XLA_PEAK_TFLOPS:-918}" \

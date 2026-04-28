@@ -100,9 +100,9 @@ utilization over the default `b12c192`.
 The JAX path is intended for performance A/B testing after the PyTorch/XLA
 baseline shows low TPU utilization. It currently supports the fixed-board
 real-data path, AdamW, warmup+cosine LR, history matrices, X/Y/T symmetries,
-BF16 matmul/conv compute, `score_mode=simple`, and pickle checkpoints. It does
-not yet implement validation, resume, variable-size board masks, or the
-`mixop` score-belief head.
+BF16 matmul/conv compute, `score_mode=simple`, validation, automatic resume,
+and pickle checkpoints. It does not yet implement multi-device sharding,
+variable-size board masks, or the `mixop` score-belief head.
 
 In a Colab TPU runtime:
 
@@ -119,8 +119,8 @@ bash train_jax.sh
 ```
 
 If the stable windows after the first compile land far above the PyTorch/XLA
-run, the next migration step is adding validation/resume and then moving the
-default TPU path over to JAX.
+run, the next migration step is making the JAX path the default TPU runner and
+then filling in the remaining feature gaps.
 
 ## CUDA Training Example
 
