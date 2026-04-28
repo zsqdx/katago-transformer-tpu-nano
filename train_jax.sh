@@ -79,6 +79,8 @@ python -u train_jax.py \
     --lr "${LR:-2e-4}" \
     --wd "${WD:-0.1}" \
     --optimizer "${OPTIMIZER:-adamw}" \
+    --muon-lr-multiplier "${MUON_LR_MULTIPLIER:-0.2}" \
+    --muon-momentum "${MUON_MOMENTUM:-0.95}" \
     --loss-profile "${LOSS_PROFILE:-full}" \
     --grad-clip-norm "${GRAD_CLIP_NORM:-0}" \
     --lr-schedule "${LR_SCHEDULE:-cosine}" \

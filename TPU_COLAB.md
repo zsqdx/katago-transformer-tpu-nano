@@ -505,6 +505,11 @@ The current best single-chip TPU v6e profile from short sweeps is packaged as
 storage/activations, BF16 RoPE/SwiGLU/attention logits, and train-buffer
 donation. It is the recommended speed baseline, while longer runs should still
 validate training quality.
+Set `OPTIMIZER=muon` to use Muon for transformer block matrix weights and
+AdamW for stem/head/norm parameters. Defaults match the PyTorch path
+(`MUON_LR_MULTIPLIER=0.2`, `MUON_MOMENTUM=0.95`). Use `NO_RESUME=1` when
+switching an existing JAX run between AdamW and Muon because the optimizer
+state layout differs.
 Set `OPTIMIZER=none` or `OPTIMIZER=sgd` only for profiling optimizer overhead:
 `none` skips parameter updates and may let XLA eliminate unused backward work,
 so treat it as a forward/loss lower-bound probe; `sgd` keeps gradients live

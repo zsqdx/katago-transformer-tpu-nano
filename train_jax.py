@@ -174,6 +174,155 @@ def _get_path(tree, path):
     return cur
 
 
+_POLAR_EXPRESS_COEFFS = (
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+)
+
+
+def _is_muon_path(path, leaf):
+    if not path or path[0] != "blocks" or path[-1] != "w":
+        return False
+    return getattr(leaf, "ndim", 0) >= 2
+
+
+def _is_qkv_projection_path(path):
+    return any(part in ("q_proj", "k_proj", "v_proj") for part in path)
+
+
+def init_muon_adamw_state(params, dtype=None):
+    import jax.numpy as jnp
+
+    state_dtype = jnp.float32 if dtype is None else dtype
+
+    def init_v(path, p):
+        if _is_muon_path(path, p):
+            return jnp.zeros((), dtype=state_dtype)
+        return jnp.zeros(p.shape, dtype=state_dtype)
+
+    return {
+        # AdamW first moment for non-Muon leaves; Muon momentum for block matrix leaves.
+        "m": _tree_map(lambda p: jnp.zeros(p.shape, dtype=state_dtype), params),
+        # AdamW second moment is unnecessary for Muon leaves, so store scalar sentinels there.
+        "v": _tree_map_with_path(init_v, params),
+    }
+
+
+def _muon_split_for_path(path, tensor, num_heads):
+    if tensor.ndim == 4:
+        tensor = tensor.reshape((tensor.shape[0], -1))
+    if _is_qkv_projection_path(path) and num_heads > 0:
+        if tensor.shape[-2] % num_heads != 0:
+            raise ValueError(f"Cannot head-split Muon param {'/'.join(path)} with shape {tensor.shape}")
+        return tensor.reshape((-1, tensor.shape[-2] // num_heads, tensor.shape[-1]))
+    return tensor
+
+
+def polar_express_jax(g):
+    import jax.numpy as jnp
+
+    x = g.astype(jnp.bfloat16)
+    transposed = g.shape[-2] > g.shape[-1]
+    if transposed:
+        x = jnp.swapaxes(x, -1, -2)
+
+    norm = jnp.sqrt(jnp.sum(jnp.square(x.astype(jnp.float32)), axis=(-2, -1), keepdims=True))
+    x = (x / (norm.astype(jnp.float32) * 1.02 + 1e-6)).astype(jnp.bfloat16)
+
+    for a, b, c in _POLAR_EXPRESS_COEFFS:
+        a_v = jnp.asarray(a, dtype=jnp.bfloat16)
+        b_v = jnp.asarray(b, dtype=jnp.bfloat16)
+        c_v = jnp.asarray(c, dtype=jnp.bfloat16)
+        xx_t = jnp.swapaxes(x, -1, -2)
+        a_mat = (x @ xx_t).astype(jnp.bfloat16)
+        b_mat = (b_v * a_mat + c_v * (a_mat @ a_mat)).astype(jnp.bfloat16)
+        x = (a_v * x + b_mat @ x).astype(jnp.bfloat16)
+
+    if transposed:
+        x = jnp.swapaxes(x, -1, -2)
+    return x
+
+
+def muon_adamw_update(
+    params,
+    grads,
+    state,
+    step,
+    lr,
+    wd,
+    config,
+    state_dtype=None,
+    param_dtype=None,
+    update_dtype=None,
+    beta1=0.9,
+    beta2=0.95,
+    eps=1e-8,
+    muon_lr_multiplier=0.2,
+    muon_momentum=0.95,
+):
+    import jax.numpy as jnp
+
+    state_dtype = jnp.float32 if state_dtype is None else state_dtype
+    param_dtype = jnp.float32 if param_dtype is None else param_dtype
+    update_dtype = jnp.float32 if update_dtype is None else update_dtype
+    beta1_v = jnp.asarray(beta1, dtype=update_dtype)
+    beta2_v = jnp.asarray(beta2, dtype=update_dtype)
+    one_v = jnp.asarray(1.0, dtype=update_dtype)
+    bc1 = jnp.asarray(1.0 - beta1 ** step, dtype=update_dtype)
+    bc2 = jnp.asarray(1.0 - beta2 ** step, dtype=update_dtype)
+    eps_v = jnp.asarray(eps, dtype=update_dtype)
+    lr_v = jnp.asarray(lr, dtype=update_dtype)
+    wd_v = jnp.asarray(wd, dtype=update_dtype)
+    muon_lr_v = lr_v * jnp.asarray(muon_lr_multiplier, dtype=update_dtype)
+    muon_momentum_v = jnp.asarray(muon_momentum, dtype=update_dtype)
+    num_heads = int(config["num_heads"])
+
+    def update_leaf(path, p):
+        g = _get_path(grads, path)
+        m = _get_path(state["m"], path)
+        v = _get_path(state["v"], path)
+        if _is_muon_path(path, p):
+            new_m_leaf = muon_momentum_v * m.astype(update_dtype) + g.astype(update_dtype)
+            split_update = _muon_split_for_path(path, new_m_leaf, num_heads)
+            split_update = polar_express_jax(split_update)
+            scale = math.sqrt(max(split_update.shape[-2], split_update.shape[-1]))
+            update = (split_update * jnp.asarray(scale, dtype=split_update.dtype)).reshape(p.shape)
+            p_new = p.astype(update_dtype) * (one_v - lr_v * wd_v)
+            p_new = p_new - muon_lr_v * update.astype(update_dtype)
+            return p_new.astype(param_dtype), new_m_leaf.astype(state_dtype), v
+
+        new_m_leaf = beta1_v * m.astype(update_dtype) + (one_v - beta1_v) * g.astype(update_dtype)
+        new_v_leaf = beta2_v * v.astype(update_dtype) + (one_v - beta2_v) * jnp.square(g.astype(update_dtype))
+        m_hat = new_m_leaf / bc1
+        v_hat = new_v_leaf / bc2
+        p_update = m_hat / (jnp.sqrt(v_hat) + eps_v)
+        p_new = p.astype(update_dtype) - lr_v * p_update
+        if _decay_mask_for_path(path):
+            p_new = p_new - lr_v * wd_v * p.astype(update_dtype)
+        return p_new.astype(param_dtype), new_m_leaf.astype(state_dtype), new_v_leaf.astype(state_dtype)
+
+    def extract_updated(tree, idx):
+        if isinstance(tree, dict):
+            return {k: extract_updated(v, idx) for k, v in tree.items()}
+        if isinstance(tree, list):
+            return [extract_updated(v, idx) for v in tree]
+        if isinstance(tree, tuple) and len(tree) == 3:
+            return tree[idx]
+        raise TypeError(f"Unexpected Muon update tree leaf: {type(tree)}")
+
+    updated = _tree_map_with_path(update_leaf, params)
+    return (
+        extract_updated(updated, 0),
+        {
+            "m": extract_updated(updated, 1),
+            "v": extract_updated(updated, 2),
+        },
+    )
+
+
 def estimate_forward_flops(config, pos_len, score_mode="simple"):
     s = pos_len * pos_len
     d = config["hidden_size"]
@@ -281,7 +430,9 @@ def main():
     parser.add_argument("--model-kind", type=str, default="b12c2048")
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--wd", type=float, default=0.1)
-    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sgd", "none"])
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon", "sgd", "none"])
+    parser.add_argument("--muon-lr-multiplier", type=float, default=0.2)
+    parser.add_argument("--muon-momentum", type=float, default=0.95)
     parser.add_argument("--loss-profile", type=str, default="full",
                         choices=["full", "policy_value", "policy_only", "value_only"])
     parser.add_argument("--grad-clip-norm", type=float, default=0.0)
@@ -394,6 +545,11 @@ def main():
             raise ValueError(f"{checkpoint_path}: checkpoint model_config does not match {args.model_kind}")
         if int(meta.get("pos_len", args.pos_len)) != args.pos_len:
             raise ValueError(f"{checkpoint_path}: checkpoint pos_len does not match {args.pos_len}")
+        if meta.get("optimizer", args.optimizer) != args.optimizer:
+            raise ValueError(
+                f"{checkpoint_path}: checkpoint optimizer={meta.get('optimizer')} does not match "
+                f"--optimizer={args.optimizer}; set NO_RESUME=1 when switching optimizers"
+            )
         state_params = state["params"]
         expected_stacked_blocks = args.stack_blocks or args.scan_blocks
         if isinstance(state_params.get("blocks"), dict) != expected_stacked_blocks:
@@ -418,7 +574,10 @@ def main():
         )
         params = _tree_map(lambda x: x.astype(param_dtype), params)
         params = jax.device_put(params)
-        opt_state = jax.device_put(init_adam_state(params, dtype=opt_state_dtype))
+        if args.optimizer == "muon":
+            opt_state = jax.device_put(init_muon_adamw_state(params, dtype=opt_state_dtype))
+        else:
+            opt_state = jax.device_put(init_adam_state(params, dtype=opt_state_dtype))
 
     td_value_loss_scales = (0.6, 0.6, 0.6)
 
@@ -480,6 +639,15 @@ def main():
                 param_dtype=param_dtype,
                 update_dtype=opt_update_dtype,
             )
+        elif args.optimizer == "muon":
+            new_params, new_opt_state = muon_adamw_update(
+                params_, grads, opt_state_, opt_step, lr, wd, model_config,
+                state_dtype=opt_state_dtype,
+                param_dtype=param_dtype,
+                update_dtype=opt_update_dtype,
+                muon_lr_multiplier=args.muon_lr_multiplier,
+                muon_momentum=args.muon_momentum,
+            )
         elif args.optimizer == "sgd":
             new_params = sgd_update(
                 params_, grads, lr, wd,
@@ -525,7 +693,7 @@ def main():
         )
 
     if args.donate_train_buffers:
-        train_donate_argnums = (0, 1) if args.optimizer == "adamw" else (0,)
+        train_donate_argnums = (0, 1) if args.optimizer in ("adamw", "muon") else (0,)
     else:
         train_donate_argnums = ()
     train_steps = jax.jit(train_steps_impl, donate_argnums=train_donate_argnums)
@@ -862,6 +1030,27 @@ def main():
                 grads,
                 opt_state,
             )
+        elif args.optimizer == "muon":
+            _ = time_component(
+                "optimizer_muon_adamw_update",
+                lambda params_i, grads_i, opt_state_i: muon_adamw_update(
+                    params_i,
+                    grads_i,
+                    opt_state_i,
+                    jnp.asarray(1.0, dtype=jnp.float32),
+                    jnp.asarray(args.lr, dtype=jnp.float32),
+                    jnp.asarray(args.wd, dtype=jnp.float32),
+                    model_config,
+                    state_dtype=opt_state_dtype,
+                    param_dtype=param_dtype,
+                    update_dtype=opt_update_dtype,
+                    muon_lr_multiplier=args.muon_lr_multiplier,
+                    muon_momentum=args.muon_momentum,
+                )[0],
+                params,
+                grads,
+                opt_state,
+            )
         elif args.optimizer == "sgd":
             _ = time_component(
                 "optimizer_sgd_update",
@@ -921,6 +1110,8 @@ def main():
             "model_config": model_config,
             "pos_len": args.pos_len,
             "optimizer": args.optimizer,
+            "muon_lr_multiplier": args.muon_lr_multiplier,
+            "muon_momentum": args.muon_momentum,
             "loss_profile": args.loss_profile,
             "log_step_time": args.log_step_time,
             "moving_sum": float(jax.device_get(moving_sum)),
