@@ -328,8 +328,25 @@ def muon_adamw_update(
     muon_row_split_size=0,
     muon_target="all",
     muon_polar_steps=5,
+    muon_group_blocks=True,
 ):
     import jax.numpy as jnp
+
+    if str(muon_target).lower() == "none":
+        return adamw_update(
+            params,
+            grads,
+            state,
+            step,
+            lr,
+            wd,
+            state_dtype=state_dtype,
+            param_dtype=param_dtype,
+            update_dtype=update_dtype,
+            beta1=beta1,
+            beta2=beta2,
+            eps=eps,
+        )
 
     state_dtype = jnp.float32 if state_dtype is None else state_dtype
     param_dtype = jnp.float32 if param_dtype is None else param_dtype
@@ -384,7 +401,7 @@ def muon_adamw_update(
             return tree[idx]
         raise TypeError(f"Unexpected Muon update tree leaf: {type(tree)}")
 
-    if isinstance(params.get("blocks"), list):
+    if muon_group_blocks and isinstance(params.get("blocks"), list):
         new_params = {}
         new_m = {}
         new_v = {}
@@ -613,6 +630,7 @@ def main():
     parser.add_argument("--muon-row-split-size", type=int, default=0)
     parser.add_argument("--muon-target", type=str, default="all", choices=["all", "attn", "ffn", "square", "none"])
     parser.add_argument("--muon-polar-steps", type=int, default=5)
+    parser.add_argument("--muon-group-blocks", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--loss-profile", type=str, default="full",
                         choices=["full", "policy_value", "policy_only", "value_only"])
     parser.add_argument("--grad-clip-norm", type=float, default=0.0)
@@ -844,6 +862,7 @@ def main():
                 muon_row_split_size=args.muon_row_split_size,
                 muon_target=args.muon_target,
                 muon_polar_steps=args.muon_polar_steps,
+                muon_group_blocks=args.muon_group_blocks,
             )
         elif args.optimizer == "sgd":
             new_params = sgd_update(
@@ -933,6 +952,7 @@ def main():
             muon_row_split_size=args.muon_row_split_size,
             muon_target=args.muon_target,
             muon_polar_steps=args.muon_polar_steps,
+            muon_group_blocks=args.muon_group_blocks,
         )
 
     muon_update_donate_argnums = (0, 1) if args.donate_train_buffers else ()
@@ -1314,6 +1334,7 @@ def main():
                     muon_row_split_size=args.muon_row_split_size,
                     muon_target=args.muon_target,
                     muon_polar_steps=args.muon_polar_steps,
+                    muon_group_blocks=args.muon_group_blocks,
                 )[0],
                 params,
                 grads,
@@ -1383,6 +1404,7 @@ def main():
             "muon_row_split_size": args.muon_row_split_size,
             "muon_target": args.muon_target,
             "muon_polar_steps": args.muon_polar_steps,
+            "muon_group_blocks": args.muon_group_blocks,
             "muon_split_jit": args.muon_split_jit,
             "loss_profile": args.loss_profile,
             "log_step_time": args.log_step_time,

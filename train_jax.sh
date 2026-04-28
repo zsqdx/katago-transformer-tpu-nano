@@ -58,6 +58,9 @@ fi
 if [ "${MUON_SPLIT_JIT:-0}" != "0" ]; then
     EXTRA_FLAGS+=(--muon-split-jit)
 fi
+if [ "${MUON_GROUP_BLOCKS:-1}" = "0" ]; then
+    EXTRA_FLAGS+=(--no-muon-group-blocks)
+fi
 if [ "${STACK_BLOCKS:-0}" != "0" ]; then
     EXTRA_FLAGS+=(--stack-blocks)
 fi
