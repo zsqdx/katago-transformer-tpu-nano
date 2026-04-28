@@ -196,6 +196,8 @@ def main():
     parser.add_argument("--allow-nonfull-mask", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--separate-projections", action="store_true")
+    parser.add_argument("--fuse-projections", action="store_true")
+    parser.add_argument("--attention-impl", type=str, default="manual", choices=["manual", "xla"])
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--init-std", type=float, default=0.02)
     parser.add_argument("--score-mode", type=str, default="simple", choices=["simple"])
@@ -270,7 +272,7 @@ def main():
             args.pos_len,
             init_std=args.init_std,
             score_mode=args.score_mode,
-            fuse_projections=not args.separate_projections,
+            fuse_projections=args.fuse_projections and not args.separate_projections,
         )
         params = jax.device_put(params)
         opt_state = jax.device_put(init_adam_state(params))
@@ -279,7 +281,7 @@ def main():
 
     def loss_fn(params_, batch_, moving_sum_, moving_weight_, is_training):
         outputs = jax_model.forward(params_, batch_["binaryInputNCHW"], batch_["globalInputNC"],
-                                    model_config, args.pos_len, rope_cache)
+                                    model_config, args.pos_len, rope_cache, attention_impl=args.attention_impl)
         return jax_losses.postprocess_and_loss_core(
             outputs,
             score_offsets,
@@ -381,7 +383,8 @@ def main():
             "pos_len": args.pos_len,
             "moving_sum": float(jax.device_get(moving_sum)),
             "moving_weight": float(jax.device_get(moving_weight)),
-            "fuse_projections": not args.separate_projections,
+            "fuse_projections": args.fuse_projections and not args.separate_projections,
+            "attention_impl": args.attention_impl,
         }
 
     def log_metric_summary(prefix, samples, metrics_host, batch_count):

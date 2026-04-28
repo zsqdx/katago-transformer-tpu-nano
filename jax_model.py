@@ -95,8 +95,19 @@ def apply_rope(q, k, cos, sin):
     )
 
 
-def attention(q, k, v, mask=None):
+def attention(q, k, v, mask=None, attention_impl="manual"):
     # q,k,v: B,L,H,D
+    if attention_impl == "xla":
+        if mask is not None:
+            raise ValueError("attention_impl='xla' does not support the manual mask layout yet")
+        return jax.nn.dot_product_attention(
+            q.astype(COMPUTE_DTYPE),
+            k.astype(COMPUTE_DTYPE),
+            v.astype(COMPUTE_DTYPE),
+            scale=1.0 / math.sqrt(q.shape[-1]),
+            implementation="xla",
+        ).astype(jnp.float32)
+
     q = jnp.transpose(q, (0, 2, 1, 3))
     k = jnp.transpose(k, (0, 2, 1, 3))
     v = jnp.transpose(v, (0, 2, 1, 3))
@@ -113,7 +124,7 @@ def attention(q, k, v, mask=None):
     return jnp.transpose(out, (0, 2, 1, 3))
 
 
-def init_params(key, config, pos_len, init_std=0.02, score_mode="simple", fuse_projections=True):
+def init_params(key, config, pos_len, init_std=0.02, score_mode="simple", fuse_projections=False):
     if score_mode != "simple":
         raise ValueError("The first JAX TPU path currently supports score_mode='simple' only")
 
@@ -167,7 +178,7 @@ def init_params(key, config, pos_len, init_std=0.02, score_mode="simple", fuse_p
     return params
 
 
-def transformer_block(params, x, rope_cos, rope_sin, num_heads):
+def transformer_block(params, x, rope_cos, rope_sin, num_heads, attention_impl="manual"):
     bsz, seq_len, channels = x.shape
     head_dim = channels // num_heads
 
@@ -183,7 +194,7 @@ def transformer_block(params, x, rope_cos, rope_sin, num_heads):
     k = k.reshape(bsz, seq_len, num_heads, head_dim)
     v = v.reshape(bsz, seq_len, num_heads, head_dim)
     q, k = apply_rope(q, k, rope_cos, rope_sin)
-    attn_out = attention(q, k, v).reshape(bsz, seq_len, channels)
+    attn_out = attention(q, k, v, attention_impl=attention_impl).reshape(bsz, seq_len, channels)
     x = x + linear(params["out_proj"], attn_out)
 
     x_norm = rms_norm(params["norm2"], x)
@@ -198,7 +209,7 @@ def transformer_block(params, x, rope_cos, rope_sin, num_heads):
     return x + linear(params["ffn_w2"], hidden)
 
 
-def forward(params, binary_input, global_input, config, pos_len, rope_cache):
+def forward(params, binary_input, global_input, config, pos_len, rope_cache, attention_impl="manual"):
     c = config["hidden_size"]
     num_heads = config["num_heads"]
     n = binary_input.shape[0]
@@ -211,7 +222,7 @@ def forward(params, binary_input, global_input, config, pos_len, rope_cache):
 
     rope_cos, rope_sin = rope_cache
     for block in params["blocks"]:
-        x = transformer_block(block, x, rope_cos, rope_sin, num_heads)
+        x = transformer_block(block, x, rope_cos, rope_sin, num_heads, attention_impl=attention_impl)
     x = rms_norm(params["norm_final"], x).astype(jnp.float32)
 
     board = jnp.transpose(linear(params["policy_head"]["linear_board"], x), (0, 2, 1))

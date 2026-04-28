@@ -459,10 +459,19 @@ TRAINDIR=./jax_tpu_run_b24c1024_b16_s4 \
 bash train_jax.sh
 ```
 
-New JAX runs initialize fused QKV and fused SwiGLU up/gate projections by
-default. This keeps the math equivalent but gives XLA fewer, wider dot
-operations per transformer block. Set `SEPARATE_PROJECTIONS=1` only when you
-want to compare against the older unfused layout.
+Projection layers are separate by default because early TPU A/B runs showed
+the fused QKV/SwiGLU layout was slower for `b24c1024`. Set
+`FUSE_PROJECTIONS=1` only when you want to compare against that fused layout.
+The next useful code-level A/B is JAX/XLA's built-in dot-product attention:
+
+```bash
+MODEL_KIND=b24c1024 \
+BATCH_SIZE=16 \
+ATTENTION_IMPL=xla \
+NO_RESUME=1 \
+TRAINDIR=./jax_tpu_run_b24c1024_b16_attn_xla \
+bash train_jax.sh
+```
 
 For reference, the command expanded by `train.sh` is equivalent to:
 

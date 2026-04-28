@@ -125,9 +125,18 @@ then filling in the remaining feature gaps.
 For deeper/narrower presets such as `b24c1024`, try `STEPS_PER_JIT=4` or `8`
 to execute several optimizer steps per XLA call. This reduces per-step dispatch
 overhead without changing the per-sample LR schedule or checkpoint semantics.
-New JAX runs also initialize fused QKV and fused SwiGLU up/gate projection
-weights by default, which reduces the number of per-block dot operations. Set
-`SEPARATE_PROJECTIONS=1` only for A/B comparisons with the older layout.
+Projection layers are separate by default because early TPU A/B runs showed the
+fused QKV/SwiGLU layout was slower for `b24c1024`; set `FUSE_PROJECTIONS=1`
+only for that A/B. To test JAX/XLA's built-in attention lowering:
+
+```bash
+MODEL_KIND=b24c1024 \
+BATCH_SIZE=16 \
+ATTENTION_IMPL=xla \
+NO_RESUME=1 \
+TRAINDIR=./jax_tpu_run_b24c1024_b16_attn_xla \
+bash train_jax.sh
+```
 
 ## CUDA Training Example
 
