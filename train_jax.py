@@ -12,7 +12,6 @@ import math
 import os
 import pickle
 import time
-from functools import partial
 
 import numpy as np
 
@@ -248,7 +247,7 @@ def main():
             td_value_loss_scales=td_value_loss_scales,
         )
 
-    @partial(jax.jit, donate_argnums=(0, 1, 2))
+    @jax.jit
     def train_step(params_, opt_state_, batch_, moving_sum_, moving_weight_, opt_step, lr, wd):
         def scalar_loss(p):
             loss, metrics, new_moving_sum, new_moving_weight = loss_fn(p, batch_, moving_sum_, moving_weight_)
