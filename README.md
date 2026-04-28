@@ -202,6 +202,11 @@ to `jax_shape_sweep_*/summary.tsv`. Override the candidate list with
 Set `SWEEP_COMPONENT_PROFILE=1` to also run the component microprofile for
 each candidate. The sweep disables final checkpoint saves to keep the search
 fast and disk-light.
+Set `SWEEP_FAST_BF16=1` to sweep with the current fast TPU profile
+(`ROPE_DTYPE=bf16`, `FFN_MUL_DTYPE=bf16`, `ATTENTION_LOGITS_DTYPE=bf16`, and
+`DONATE_TRAIN_BUFFERS=1`). To sweep batch size around one model, run
+`bash sweep_jax_batches.sh`; override with `MODEL_KIND=b24c2048` and
+`BATCH_SIZES="8 12 16 20 24 32"`.
 
 ## CUDA Training Example
 
