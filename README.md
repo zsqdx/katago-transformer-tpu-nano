@@ -138,6 +138,10 @@ TRAINDIR=./jax_tpu_run_b24c1024_b16_attn_xla \
 bash train_jax.sh
 ```
 
+Gradient norm logging is off by default when `GRAD_CLIP_NORM=0`, avoiding an
+extra full-gradient reduction on large models. Set `LOG_GRAD_NORM=1` to restore
+the old log field for debugging.
+
 ## CUDA Training Example
 
 ```bash

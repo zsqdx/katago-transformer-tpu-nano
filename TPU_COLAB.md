@@ -473,6 +473,10 @@ TRAINDIR=./jax_tpu_run_b24c1024_b16_attn_xla \
 bash train_jax.sh
 ```
 
+When `GRAD_CLIP_NORM=0`, gradient norm logging is disabled by default to avoid
+an extra full-gradient reduction every step. Set `LOG_GRAD_NORM=1` if you want
+that diagnostic back.
+
 For reference, the command expanded by `train.sh` is equivalent to:
 
 ```bash

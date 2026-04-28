@@ -37,6 +37,9 @@ fi
 if [ "${FUSE_PROJECTIONS:-0}" != "0" ]; then
     EXTRA_FLAGS+=(--fuse-projections)
 fi
+if [ "${LOG_GRAD_NORM:-0}" != "0" ]; then
+    EXTRA_FLAGS+=(--log-grad-norm)
+fi
 
 MAX_TRAINING_SAMPLES_VALUE="${MAX_TRAINING_SAMPLES:-32768}"
 SAVE_EVERY_SAMPLES_VALUE="${SAVE_EVERY_SAMPLES:-${MAX_TRAINING_SAMPLES_VALUE}}"

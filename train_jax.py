@@ -198,6 +198,7 @@ def main():
     parser.add_argument("--separate-projections", action="store_true")
     parser.add_argument("--fuse-projections", action="store_true")
     parser.add_argument("--attention-impl", type=str, default="manual", choices=["manual", "xla"])
+    parser.add_argument("--log-grad-norm", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--init-std", type=float, default=0.02)
     parser.add_argument("--score-mode", type=str, default="simple", choices=["simple"])
@@ -205,6 +206,7 @@ def main():
     args = parser.parse_args()
     if args.steps_per_jit < 1:
         raise ValueError("--steps-per-jit must be >= 1")
+    track_grad_norm = args.log_grad_norm or args.grad_clip_norm > 0
 
     try:
         import jax_losses as _jax_losses
@@ -306,7 +308,10 @@ def main():
         (loss, (metrics, new_moving_sum, new_moving_weight)), grads = jax.value_and_grad(
             scalar_loss, has_aux=True
         )(params_)
-        grad_norm = jnp.sqrt(_tree_sum_squares(grads))
+        if track_grad_norm:
+            grad_norm = jnp.sqrt(_tree_sum_squares(grads))
+        else:
+            grad_norm = jnp.asarray(0.0, dtype=jnp.float32)
         if args.grad_clip_norm > 0:
             scale = jnp.minimum(1.0, args.grad_clip_norm / (grad_norm + 1e-6))
             grads = _tree_map(lambda g: g * scale, grads)
@@ -472,10 +477,15 @@ def main():
             tflops = sps * train_flops_per_sample / 1e12
             mfu = tflops / args.xla_peak_tflops * 100.0 if args.xla_peak_tflops > 0 else 0.0
             by_key = dict(zip(jax_losses.METRIC_KEYS, metrics_host.tolist()))
+            grad_norm_text = (
+                f"{float(grad_norm_host) / batch_count:.3f}"
+                if track_grad_norm else
+                "off"
+            )
             logging.info(
                 "step=%d, samples=%d, time=%.1fs, lr=%.2e, wd=%.4f, "
                 "loss=%.4f, p0loss=%.4f, vloss=%.4f, oloss=%.4f, skloss=%.4f, "
-                "pacc1=%.4f, grad_norm=%.3f, sps=%.1f, TFLOPS=%.2f, MFU=%.2f%%",
+                "pacc1=%.4f, grad_norm=%s, sps=%.1f, TFLOPS=%.2f, MFU=%.2f%%",
                 step,
                 total_samples,
                 elapsed,
@@ -487,7 +497,7 @@ def main():
                 by_key["oloss"] / weight_sum,
                 by_key["skloss"] / weight_sum,
                 by_key["pacc1"] / weight_sum,
-                float(grad_norm_host) / batch_count,
+                grad_norm_text,
                 sps,
                 tflops,
                 mfu,
