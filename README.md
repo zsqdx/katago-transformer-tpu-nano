@@ -142,6 +142,11 @@ Gradient norm logging is off by default when `GRAD_CLIP_NORM=0`, avoiding an
 extra full-gradient reduction on large models. Set `LOG_GRAD_NORM=1` to restore
 the old log field for debugging.
 
+Two mixed-precision A/B switches are also available for TPU profiling:
+`ACTIVATION_DTYPE=bf16` keeps trunk activations in BF16 between transformer
+ops, and `OPT_STATE_DTYPE=bf16` stores AdamW moment buffers in BF16. Both
+default to `float32` until their training impact is measured.
+
 ## CUDA Training Example
 
 ```bash

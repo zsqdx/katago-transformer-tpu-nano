@@ -66,6 +66,8 @@ python -u train_jax.py \
     --symmetry-type "${SYMMETRY_TYPE:-xyt}" \
     --score-mode "${SCORE_MODE:-simple}" \
     --attention-impl "${ATTENTION_IMPL:-manual}" \
+    --activation-dtype "${ACTIVATION_DTYPE:-float32}" \
+    --opt-state-dtype "${OPT_STATE_DTYPE:-float32}" \
     --xla-peak-tflops "${XLA_PEAK_TFLOPS:-918}" \
     --allow-nonfull-mask \
     --seed "${SEED:-1234}" \

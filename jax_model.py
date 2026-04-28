@@ -16,6 +16,15 @@ EXTRA_SCORE_DISTR_RADIUS = 60
 COMPUTE_DTYPE = jnp.bfloat16
 
 
+def dtype_from_name(name):
+    normalized = str(name).lower()
+    if normalized in ("float32", "fp32"):
+        return jnp.float32
+    if normalized in ("bfloat16", "bf16"):
+        return jnp.bfloat16
+    raise ValueError(f"Unsupported dtype: {name}")
+
+
 def _split(key, n):
     return jax.random.split(key, n)
 
@@ -35,24 +44,24 @@ def init_conv(key, in_ch, out_ch, kernel, std):
     return {"w": _normal(key, (out_ch, in_ch, kernel, kernel), std)}
 
 
-def linear(params, x):
+def linear(params, x, out_dtype=jnp.float32):
     y = jnp.matmul(
         x.astype(COMPUTE_DTYPE),
         jnp.swapaxes(params["w"], -1, -2).astype(COMPUTE_DTYPE),
     ).astype(jnp.float32)
     if "b" in params:
         y = y + params["b"]
-    return y
+    return y.astype(out_dtype)
 
 
-def conv2d_nchw(params, x):
+def conv2d_nchw(params, x, out_dtype=jnp.float32):
     return jax.lax.conv_general_dilated(
         x.astype(COMPUTE_DTYPE),
         params["w"].astype(COMPUTE_DTYPE),
         window_strides=(1, 1),
         padding="SAME",
         dimension_numbers=("NCHW", "OIHW", "NCHW"),
-    ).astype(jnp.float32)
+    ).astype(out_dtype)
 
 
 def rms_norm(params, x, eps=1e-6):
@@ -95,7 +104,7 @@ def apply_rope(q, k, cos, sin):
     )
 
 
-def attention(q, k, v, mask=None, attention_impl="manual"):
+def attention(q, k, v, mask=None, attention_impl="manual", out_dtype=jnp.float32):
     # q,k,v: B,L,H,D
     if attention_impl == "xla":
         if mask is not None:
@@ -106,7 +115,7 @@ def attention(q, k, v, mask=None, attention_impl="manual"):
             v.astype(COMPUTE_DTYPE),
             scale=1.0 / math.sqrt(q.shape[-1]),
             implementation="xla",
-        ).astype(jnp.float32)
+        ).astype(out_dtype)
 
     q = jnp.transpose(q, (0, 2, 1, 3))
     k = jnp.transpose(k, (0, 2, 1, 3))
@@ -120,7 +129,7 @@ def attention(q, k, v, mask=None, attention_impl="manual"):
     if mask is not None:
         logits = logits + mask
     weights = jax.nn.softmax(logits, axis=-1).astype(COMPUTE_DTYPE)
-    out = jnp.einsum("bhlm,bhmd->bhld", weights, v.astype(COMPUTE_DTYPE)).astype(jnp.float32)
+    out = jnp.einsum("bhlm,bhmd->bhld", weights, v.astype(COMPUTE_DTYPE)).astype(out_dtype)
     return jnp.transpose(out, (0, 2, 1, 3))
 
 
@@ -178,51 +187,82 @@ def init_params(key, config, pos_len, init_std=0.02, score_mode="simple", fuse_p
     return params
 
 
-def transformer_block(params, x, rope_cos, rope_sin, num_heads, attention_impl="manual"):
+def transformer_block(
+    params,
+    x,
+    rope_cos,
+    rope_sin,
+    num_heads,
+    attention_impl="manual",
+    activation_dtype=jnp.float32,
+):
     bsz, seq_len, channels = x.shape
     head_dim = channels // num_heads
 
     x_norm = rms_norm(params["norm1"], x)
     if "qkv_proj" in params:
-        qkv = linear(params["qkv_proj"], x_norm)
+        qkv = linear(params["qkv_proj"], x_norm, out_dtype=activation_dtype)
         q, k, v = jnp.split(qkv, 3, axis=-1)
     else:
-        q = linear(params["q_proj"], x_norm)
-        k = linear(params["k_proj"], x_norm)
-        v = linear(params["v_proj"], x_norm)
+        q = linear(params["q_proj"], x_norm, out_dtype=activation_dtype)
+        k = linear(params["k_proj"], x_norm, out_dtype=activation_dtype)
+        v = linear(params["v_proj"], x_norm, out_dtype=activation_dtype)
     q = q.reshape(bsz, seq_len, num_heads, head_dim)
     k = k.reshape(bsz, seq_len, num_heads, head_dim)
     v = v.reshape(bsz, seq_len, num_heads, head_dim)
     q, k = apply_rope(q, k, rope_cos, rope_sin)
-    attn_out = attention(q, k, v, attention_impl=attention_impl).reshape(bsz, seq_len, channels)
-    x = x + linear(params["out_proj"], attn_out)
+    attn_out = attention(
+        q,
+        k,
+        v,
+        attention_impl=attention_impl,
+        out_dtype=activation_dtype,
+    ).reshape(bsz, seq_len, channels)
+    x = (x + linear(params["out_proj"], attn_out, out_dtype=activation_dtype)).astype(activation_dtype)
 
     x_norm = rms_norm(params["norm2"], x)
     if "ffn_upgate" in params:
-        upgate = linear(params["ffn_upgate"], x_norm)
+        upgate = linear(params["ffn_upgate"], x_norm, out_dtype=activation_dtype)
         w1, wg = jnp.split(upgate, 2, axis=-1)
         w1 = silu(w1)
     else:
-        w1 = silu(linear(params["ffn_w1"], x_norm))
-        wg = linear(params["ffn_wgate"], x_norm)
-    hidden = (w1.astype(jnp.float32) * wg.astype(jnp.float32)).astype(x.dtype)
-    return x + linear(params["ffn_w2"], hidden)
+        w1 = silu(linear(params["ffn_w1"], x_norm, out_dtype=activation_dtype))
+        wg = linear(params["ffn_wgate"], x_norm, out_dtype=activation_dtype)
+    hidden = (w1.astype(jnp.float32) * wg.astype(jnp.float32)).astype(activation_dtype)
+    return (x + linear(params["ffn_w2"], hidden, out_dtype=activation_dtype)).astype(activation_dtype)
 
 
-def forward(params, binary_input, global_input, config, pos_len, rope_cache, attention_impl="manual"):
+def forward(
+    params,
+    binary_input,
+    global_input,
+    config,
+    pos_len,
+    rope_cache,
+    attention_impl="manual",
+    activation_dtype=jnp.float32,
+):
     c = config["hidden_size"]
     num_heads = config["num_heads"]
     n = binary_input.shape[0]
     seq_len = pos_len * pos_len
 
-    x_spatial = conv2d_nchw(params["conv_spatial"], binary_input)
-    x_global = linear(params["linear_global"], global_input)
-    x = x_spatial + x_global[:, :, None, None]
+    x_spatial = conv2d_nchw(params["conv_spatial"], binary_input, out_dtype=activation_dtype)
+    x_global = linear(params["linear_global"], global_input, out_dtype=activation_dtype)
+    x = (x_spatial + x_global[:, :, None, None]).astype(activation_dtype)
     x = jnp.transpose(x.reshape(n, c, seq_len), (0, 2, 1))
 
     rope_cos, rope_sin = rope_cache
     for block in params["blocks"]:
-        x = transformer_block(block, x, rope_cos, rope_sin, num_heads, attention_impl=attention_impl)
+        x = transformer_block(
+            block,
+            x,
+            rope_cos,
+            rope_sin,
+            num_heads,
+            attention_impl=attention_impl,
+            activation_dtype=activation_dtype,
+        )
     x = rms_norm(params["norm_final"], x).astype(jnp.float32)
 
     board = jnp.transpose(linear(params["policy_head"]["linear_board"], x), (0, 2, 1))

@@ -63,18 +63,28 @@ def _decay_mask_for_path(path):
     return not any("norm" in part for part in path)
 
 
-def init_adam_state(params):
+def init_adam_state(params, dtype=None):
     import jax.numpy as jnp
 
-    zeros = _tree_map(lambda p: jnp.zeros_like(p), params)
+    state_dtype = jnp.float32 if dtype is None else dtype
+    zeros = _tree_map(lambda p: jnp.zeros(p.shape, dtype=state_dtype), params)
     return {"m": zeros, "v": zeros}
 
 
-def adamw_update(params, grads, state, step, lr, wd, beta1=0.9, beta2=0.95, eps=1e-8):
+def adamw_update(params, grads, state, step, lr, wd, state_dtype=None, beta1=0.9, beta2=0.95, eps=1e-8):
     import jax.numpy as jnp
 
-    new_m = _tree_map(lambda m, g: beta1 * m + (1.0 - beta1) * g, state["m"], grads)
-    new_v = _tree_map(lambda v, g: beta2 * v + (1.0 - beta2) * jnp.square(g), state["v"], grads)
+    state_dtype = jnp.float32 if state_dtype is None else state_dtype
+    new_m = _tree_map(
+        lambda m, g: beta1 * m.astype(jnp.float32) + (1.0 - beta1) * g.astype(jnp.float32),
+        state["m"],
+        grads,
+    )
+    new_v = _tree_map(
+        lambda v, g: beta2 * v.astype(jnp.float32) + (1.0 - beta2) * jnp.square(g.astype(jnp.float32)),
+        state["v"],
+        grads,
+    )
     bc1 = 1.0 - beta1 ** step
     bc2 = 1.0 - beta2 ** step
 
@@ -95,7 +105,10 @@ def adamw_update(params, grads, state, step, lr, wd, beta1=0.9, beta2=0.95, eps=
         ),
         params,
     )
-    return new_params, {"m": new_m, "v": new_v}
+    return new_params, {
+        "m": _tree_map(lambda m: m.astype(state_dtype), new_m),
+        "v": _tree_map(lambda v: v.astype(state_dtype), new_v),
+    }
 
 
 def _get_path(tree, path):
@@ -198,6 +211,10 @@ def main():
     parser.add_argument("--separate-projections", action="store_true")
     parser.add_argument("--fuse-projections", action="store_true")
     parser.add_argument("--attention-impl", type=str, default="manual", choices=["manual", "xla"])
+    parser.add_argument("--activation-dtype", type=str, default="float32",
+                        choices=["float32", "fp32", "bfloat16", "bf16"])
+    parser.add_argument("--opt-state-dtype", type=str, default="float32",
+                        choices=["float32", "fp32", "bfloat16", "bf16"])
     parser.add_argument("--log-grad-norm", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--init-std", type=float, default=0.02)
@@ -223,6 +240,9 @@ def main():
 
     import jax
     import jax.numpy as jnp
+
+    activation_dtype = jax_model.dtype_from_name(args.activation_dtype)
+    opt_state_dtype = jax_model.dtype_from_name(args.opt_state_dtype)
 
     os.makedirs(args.traindir, exist_ok=True)
     logging.basicConfig(
@@ -260,7 +280,7 @@ def main():
         if int(meta.get("pos_len", args.pos_len)) != args.pos_len:
             raise ValueError(f"{checkpoint_path}: checkpoint pos_len does not match {args.pos_len}")
         params = jax.device_put(state["params"])
-        opt_state = jax.device_put(state["opt_state"])
+        opt_state = jax.device_put(_tree_map(lambda x: jnp.asarray(x, dtype=opt_state_dtype), state["opt_state"]))
         step = int(meta.get("step", 0))
         total_samples = int(meta.get("samples", 0))
         moving_sum = jnp.asarray(float(meta.get("moving_sum", 0.0)), dtype=jnp.float32)
@@ -277,13 +297,15 @@ def main():
             fuse_projections=args.fuse_projections and not args.separate_projections,
         )
         params = jax.device_put(params)
-        opt_state = jax.device_put(init_adam_state(params))
+        opt_state = jax.device_put(init_adam_state(params, dtype=opt_state_dtype))
 
     td_value_loss_scales = (0.6, 0.6, 0.6)
 
     def loss_fn(params_, batch_, moving_sum_, moving_weight_, is_training):
         outputs = jax_model.forward(params_, batch_["binaryInputNCHW"], batch_["globalInputNC"],
-                                    model_config, args.pos_len, rope_cache, attention_impl=args.attention_impl)
+                                    model_config, args.pos_len, rope_cache,
+                                    attention_impl=args.attention_impl,
+                                    activation_dtype=activation_dtype)
         return jax_losses.postprocess_and_loss_core(
             outputs,
             score_offsets,
@@ -315,7 +337,9 @@ def main():
         if args.grad_clip_norm > 0:
             scale = jnp.minimum(1.0, args.grad_clip_norm / (grad_norm + 1e-6))
             grads = _tree_map(lambda g: g * scale, grads)
-        new_params, new_opt_state = adamw_update(params_, grads, opt_state_, opt_step, lr, wd)
+        new_params, new_opt_state = adamw_update(
+            params_, grads, opt_state_, opt_step, lr, wd, state_dtype=opt_state_dtype
+        )
         return new_params, new_opt_state, new_moving_sum, new_moving_weight, metrics, grad_norm
 
     @jax.jit
@@ -390,6 +414,8 @@ def main():
             "moving_weight": float(jax.device_get(moving_weight)),
             "fuse_projections": args.fuse_projections and not args.separate_projections,
             "attention_impl": args.attention_impl,
+            "activation_dtype": args.activation_dtype,
+            "opt_state_dtype": args.opt_state_dtype,
         }
 
     def log_metric_summary(prefix, samples, metrics_host, batch_count):

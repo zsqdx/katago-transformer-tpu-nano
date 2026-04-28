@@ -477,6 +477,11 @@ When `GRAD_CLIP_NORM=0`, gradient norm logging is disabled by default to avoid
 an extra full-gradient reduction every step. Set `LOG_GRAD_NORM=1` if you want
 that diagnostic back.
 
+For profiling only, you can also test `ACTIVATION_DTYPE=bf16` and
+`OPT_STATE_DTYPE=bf16`. The former keeps trunk activations in BF16 between
+transformer ops; the latter stores AdamW moment buffers in BF16. Both remain
+`float32` by default until their effect on training quality is measured.
+
 For reference, the command expanded by `train.sh` is equivalent to:
 
 ```bash
