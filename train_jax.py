@@ -231,6 +231,7 @@ def main():
     parser.add_argument("--opt-state-dtype", type=str, default="float32",
                         choices=["float32", "fp32", "bfloat16", "bf16"])
     parser.add_argument("--log-grad-norm", action="store_true")
+    parser.add_argument("--donate-train-buffers", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--init-std", type=float, default=0.02)
     parser.add_argument("--score-mode", type=str, default="simple", choices=["simple"])
@@ -361,8 +362,7 @@ def main():
         )
         return new_params, new_opt_state, new_moving_sum, new_moving_weight, metrics, grad_norm
 
-    @jax.jit
-    def train_steps(params_, opt_state_, batches_, moving_sum_, moving_weight_, opt_steps, lrs, wds):
+    def train_steps_impl(params_, opt_state_, batches_, moving_sum_, moving_weight_, opt_steps, lrs, wds):
         def body(carry, xs):
             params_i, opt_state_i, moving_sum_i, moving_weight_i = carry
             batch_i, opt_step_i, lr_i, wd_i = xs
@@ -391,6 +391,11 @@ def main():
             jnp.sum(metrics_seq, axis=0),
             jnp.sum(grad_norm_seq),
         )
+
+    train_steps = jax.jit(
+        train_steps_impl,
+        donate_argnums=(0,) if args.donate_train_buffers else (),
+    )
 
     @jax.jit
     def eval_step(params_, batch_, moving_sum_, moving_weight_):
