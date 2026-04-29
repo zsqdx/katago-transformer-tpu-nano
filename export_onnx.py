@@ -3,6 +3,7 @@
 
 Usage:
     python export_onnx.py --checkpoint /path/to/checkpoint.ckpt
+    python export_onnx.py --checkpoint /path/to/checkpoint_jax.pkl
     python export_onnx.py --checkpoint /path/to/checkpoint.ckpt --output model.onnx --verify
     python export_onnx.py --checkpoint /path/to/checkpoint.ckpt --method te-official --device cuda
 """
@@ -10,6 +11,7 @@ Usage:
 import argparse
 import math
 import os
+import pickle
 import sys
 
 import numpy as np
@@ -39,7 +41,7 @@ if hasattr(nn, "RMSNorm"):
 
 INPUT_NAMES = ["input_spatial", "input_global"]
 BLOCKS_INPUT_NAMES = ["input_stem"]
-DEFAULT_ONNX_OPSET = 25
+DEFAULT_ONNX_OPSET = 20
 FULL_OUTPUT_NAMES = [
     "out_policy",       # (N, 6, L+1)
     "out_value",        # (N, 3)
@@ -166,6 +168,12 @@ class ExportWrapper(nn.Module):
 
 def _load_checkpoint(args):
     print(f"Loading checkpoint: {args.checkpoint}")
+    checkpoint_format = getattr(args, "checkpoint_format", "auto")
+    if checkpoint_format == "jax" or (
+        checkpoint_format == "auto" and args.checkpoint.endswith(".pkl")
+    ):
+        return _load_jax_checkpoint(args)
+
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = migrate_config(state["config"])
     varlen = state.get("varlen", False)
@@ -180,6 +188,120 @@ def _load_checkpoint(args):
     print(f"Model config: {config}")
     print(f"pos_len={args.pos_len}, score_mode={args.score_mode}, method={args.method}")
     return state, config, varlen, gated_attn, zero_centered_norm
+
+
+def _jax_array_to_torch(value):
+    arr = np.asarray(value)
+    # JAX BF16 uses ml_dtypes.bfloat16, which torch.from_numpy cannot read.
+    return torch.from_numpy(arr.astype(np.float32, copy=False)).clone()
+
+
+def _jax_tree_index(tree, index):
+    if isinstance(tree, dict):
+        return {key: _jax_tree_index(value, index) for key, value in tree.items()}
+    if isinstance(tree, tuple):
+        return tuple(_jax_tree_index(value, index) for value in tree)
+    if isinstance(tree, list):
+        return [_jax_tree_index(value, index) for value in tree]
+    return tree[index]
+
+
+def _assign_linear(state_dict, torch_prefix, jax_linear):
+    state_dict[f"{torch_prefix}.weight"] = _jax_array_to_torch(jax_linear["w"])
+    if "b" in jax_linear:
+        state_dict[f"{torch_prefix}.bias"] = _jax_array_to_torch(jax_linear["b"])
+
+
+def _jax_params_to_torch_state(params, config):
+    if "q_proj" not in _first_jax_block(params, config) and "qkv_proj" not in _first_jax_block(params, config):
+        raise RuntimeError("JAX checkpoint has no q/k/v or qkv projection weights")
+
+    state_dict = {}
+    state_dict["conv_spatial.weight"] = _jax_array_to_torch(params["conv_spatial"]["w"])
+    _assign_linear(state_dict, "linear_global", params["linear_global"])
+
+    for i in range(int(config["num_layers"])):
+        block = _get_jax_block(params, i)
+        prefix = f"blocks.{i}"
+        state_dict[f"{prefix}.norm1.norm.weight"] = _jax_array_to_torch(block["norm1"]["weight"])
+        state_dict[f"{prefix}.norm2.norm.weight"] = _jax_array_to_torch(block["norm2"]["weight"])
+
+        if "qkv_proj" in block:
+            q_w, k_w, v_w = np.split(np.asarray(block["qkv_proj"]["w"]), 3, axis=0)
+            state_dict[f"{prefix}.q_proj.weight"] = _jax_array_to_torch(q_w)
+            state_dict[f"{prefix}.k_proj.weight"] = _jax_array_to_torch(k_w)
+            state_dict[f"{prefix}.v_proj.weight"] = _jax_array_to_torch(v_w)
+        else:
+            _assign_linear(state_dict, f"{prefix}.q_proj", block["q_proj"])
+            _assign_linear(state_dict, f"{prefix}.k_proj", block["k_proj"])
+            _assign_linear(state_dict, f"{prefix}.v_proj", block["v_proj"])
+
+        _assign_linear(state_dict, f"{prefix}.out_proj", block["out_proj"])
+
+        if "ffn_upgate" in block:
+            w1_w, wgate_w = np.split(np.asarray(block["ffn_upgate"]["w"]), 2, axis=0)
+            state_dict[f"{prefix}.ffn_w1.weight"] = _jax_array_to_torch(w1_w)
+            state_dict[f"{prefix}.ffn_wgate.weight"] = _jax_array_to_torch(wgate_w)
+        else:
+            _assign_linear(state_dict, f"{prefix}.ffn_w1", block["ffn_w1"])
+            _assign_linear(state_dict, f"{prefix}.ffn_wgate", block["ffn_wgate"])
+
+        _assign_linear(state_dict, f"{prefix}.ffn_w2", block["ffn_w2"])
+
+    state_dict["norm_final.norm.weight"] = _jax_array_to_torch(params["norm_final"]["weight"])
+    _assign_linear(state_dict, "policy_head.linear_board", params["policy_head"]["linear_board"])
+    _assign_linear(state_dict, "policy_head.linear_pass", params["policy_head"]["linear_pass"])
+    _assign_linear(state_dict, "value_head.linear_sv", params["value_head"]["linear_sv"])
+    _assign_linear(state_dict, "value_head.linear_s_simple", params["value_head"]["linear_s_simple"])
+    return state_dict
+
+
+def _get_jax_block(params, index):
+    blocks = params["blocks"]
+    if isinstance(blocks, dict):
+        return _jax_tree_index(blocks, index)
+    return blocks[index]
+
+
+def _first_jax_block(params, config):
+    return _get_jax_block(params, 0 if int(config["num_layers"]) > 0 else None)
+
+
+def _load_jax_checkpoint(args):
+    with open(args.checkpoint, "rb") as f:
+        jax_state = pickle.load(f)
+    if "params" not in jax_state:
+        raise RuntimeError("JAX checkpoint must contain a 'params' tree")
+    meta = jax_state.get("meta", {})
+    if "model_config" not in meta:
+        raise RuntimeError("JAX checkpoint metadata is missing model_config")
+
+    config = migrate_config(dict(meta["model_config"]))
+    checkpoint_pos_len = int(meta.get("pos_len", args.pos_len))
+    if args.pos_len != checkpoint_pos_len:
+        print(f"JAX checkpoint pos_len={checkpoint_pos_len}; overriding --pos-len={args.pos_len}")
+        args.pos_len = checkpoint_pos_len
+
+    checkpoint_score_mode = meta.get("score_mode", "simple")
+    if args.score_mode != checkpoint_score_mode:
+        print(
+            f"JAX checkpoint score_mode={checkpoint_score_mode}; "
+            f"overriding --score-mode={args.score_mode}"
+        )
+        args.score_mode = checkpoint_score_mode
+    if args.score_mode != "simple":
+        raise RuntimeError("JAX checkpoints currently only support score_mode='simple' ONNX export")
+
+    model_state = _jax_params_to_torch_state(jax_state["params"], config)
+    state = {
+        "model": model_state,
+        "config": config,
+        "jax_meta": meta,
+    }
+    print("Detected JAX checkpoint; converted params to model.py state_dict for ONNX export")
+    print(f"Model config: {config}")
+    print(f"pos_len={args.pos_len}, score_mode={args.score_mode}, method={args.method}")
+    return state, config, False, False, False
 
 
 def _resolve_output_path(args):
@@ -1224,7 +1346,9 @@ def verify(onnx_path, model, input_spatial, input_global, provider="CPUExecution
 
 def main():
     parser = argparse.ArgumentParser(description="Export KataGo nano model to ONNX")
-    parser.add_argument("--checkpoint", required=True, help="Path to checkpoint.ckpt")
+    parser.add_argument("--checkpoint", required=True, help="Path to checkpoint.ckpt or checkpoint_jax.pkl")
+    parser.add_argument("--checkpoint-format", default="auto", choices=["auto", "torch", "jax"],
+                        help="Checkpoint format. auto treats .pkl as JAX and other paths as torch (default: auto)")
     parser.add_argument("--output", default=None, help="Output .onnx path (default: <checkpoint_dir>/model.onnx)")
     parser.add_argument("--method", type=str, default="legacy",
                         choices=["legacy", "te-official", "te-decomposed", "fp8-manual"],

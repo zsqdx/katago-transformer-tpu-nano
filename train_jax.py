@@ -1495,6 +1495,7 @@ def main():
             "muon_group_blocks": args.muon_group_blocks,
             "muon_split_jit": args.muon_split_jit,
             "loss_profile": args.loss_profile,
+            "score_mode": args.score_mode,
             "log_step_time": args.log_step_time,
             "moving_sum": float(jax.device_get(moving_sum)),
             "moving_weight": float(jax.device_get(moving_weight)),

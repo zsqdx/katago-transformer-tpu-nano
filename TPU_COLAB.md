@@ -528,6 +528,22 @@ block matrix weights use Muon. Defaults match the PyTorch Muon hyperparameters
 (`MUON_LR_MULTIPLIER=0.2`, `MUON_MOMENTUM=0.95`). Use `NO_RESUME=1` when
 switching an existing JAX run between AdamW and Muon because the optimizer
 state layout differs.
+JAX checkpoints can be exported to ONNX through the same exporter used by the
+PyTorch path:
+
+```bash
+python export_onnx.py \
+  --checkpoint ./jax_tpu_run_b24c1024_b16_muon_fastbf16/checkpoint_jax.pkl \
+  --output ./jax_tpu_run_b24c1024_b16_muon_fastbf16/model.onnx
+```
+
+The exporter auto-detects `.pkl` as a JAX checkpoint, converts the JAX parameter
+tree to the `model.py` state dict, and then runs the legacy ONNX export path.
+Install `onnx` first if your export environment does not already have it; add
+`onnxruntime` only if you want `--verify`. Use `--checkpoint-format jax` if the
+filename is nonstandard. JAX ONNX export currently supports the JAX training
+path's `score_mode=simple` fixed-board model; AQT INT8 is a training-time dot
+quantization probe and exported weights remain floating point.
 For a wider AdamW throughput baseline, run
 `OPTIMIZER=adamw MODEL_KIND=b24c2048 BATCH_SIZE=24 NO_RESUME=1 bash train_jax_best_tpu.sh`;
 that short-sweep profile reached about 43.5% MFU.
