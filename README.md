@@ -197,6 +197,7 @@ directly instead of stacking same-name block weights inside the optimizer. This
 is the default in the TPU best-profile wrapper when `OPTIMIZER=muon`.
 Use `MODEL_KIND=b24c1024 bash sweep_jax_batches.sh` for a wider batch sweep of
 the smaller 24-layer model; override `BATCH_SIZES` to refine around a winner.
+Add `OPTIMIZER=muon` to sweep the current attention-Muon TPU profile.
 Muon normally compiles as one train-step JIT so XLA can keep gradients inside
 the compiled program. If that compile stalls on a larger shape, set
 `MUON_SPLIT_JIT=1` as a slower fallback that compiles loss/grad and optimizer

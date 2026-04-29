@@ -7,6 +7,14 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 MODEL_KIND_VALUE="${MODEL_KIND:-b24c2048}"
+OPTIMIZER_VALUE="${OPTIMIZER:-adamw}"
+if [ "${OPTIMIZER_VALUE}" = "muon" ]; then
+    export MUON_TARGET="${MUON_TARGET:-attn}"
+    export MUON_POLAR_STEPS="${MUON_POLAR_STEPS:-3}"
+    export MUON_ROW_SPLIT_SIZE="${MUON_ROW_SPLIT_SIZE:-64}"
+    export MUON_GROUP_BLOCKS="${MUON_GROUP_BLOCKS:-0}"
+fi
+
 if [ -n "${BATCH_SIZES:-}" ]; then
     BATCH_SIZES_VALUE="${BATCH_SIZES}"
 elif [ "${MODEL_KIND_VALUE}" = "b24c1024" ]; then
@@ -22,4 +30,5 @@ done
 
 SWEEP_SPECS="${SWEEP_SPECS:-${specs# }}" \
 SWEEP_FAST_BF16="${SWEEP_FAST_BF16:-1}" \
+OPTIMIZER="${OPTIMIZER_VALUE}" \
 bash sweep_jax_shapes.sh
