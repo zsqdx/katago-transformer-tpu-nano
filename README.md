@@ -177,6 +177,8 @@ should still validate training quality.
 When `OPTIMIZER=muon` is used with this wrapper, the default short-sweep
 throughput profile is attention-only Muon with `MUON_POLAR_STEPS=3`,
 `MUON_ROW_SPLIT_SIZE=64`, and `MUON_GROUP_BLOCKS=0`.
+For `MODEL_KIND=b24c1024`, this wrapper defaults to `BATCH_SIZE=16`, which was
+the best short-sweep Muon batch on the single-chip TPU v6e run.
 Set `OPTIMIZER=muon` to use the original Muon-style split: transformer block
 matrix weights use Muon, while stem/head/norm parameters continue to use AdamW.
 The defaults match the PyTorch path (`MUON_LR_MULTIPLIER=0.2`,
