@@ -174,6 +174,9 @@ The current best single-chip TPU v6e profile from short sweeps is available as
 storage/activations, BF16 RoPE/SwiGLU/attention logits, and train-buffer
 donation. In short-window sweeps it reached about 43.5% MFU, but longer runs
 should still validate training quality.
+When `OPTIMIZER=muon` is used with this wrapper, the default short-sweep
+throughput profile is attention-only Muon with `MUON_POLAR_STEPS=3`,
+`MUON_ROW_SPLIT_SIZE=64`, and `MUON_GROUP_BLOCKS=0`.
 Set `OPTIMIZER=muon` to use the original Muon-style split: transformer block
 matrix weights use Muon, while stem/head/norm parameters continue to use AdamW.
 The defaults match the PyTorch path (`MUON_LR_MULTIPLIER=0.2`,
