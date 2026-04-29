@@ -7,7 +7,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 MODEL_KIND_VALUE="${MODEL_KIND:-b24c2048}"
-BATCH_SIZES_VALUE="${BATCH_SIZES:-16 20 22 24 26 28 32}"
+if [ -n "${BATCH_SIZES:-}" ]; then
+    BATCH_SIZES_VALUE="${BATCH_SIZES}"
+elif [ "${MODEL_KIND_VALUE}" = "b24c1024" ]; then
+    BATCH_SIZES_VALUE="8 12 16 20 24 28 32 40 48 56 64 80 96 112 128 160 192"
+else
+    BATCH_SIZES_VALUE="16 20 22 24 26 28 32"
+fi
 
 specs=""
 for batch in ${BATCH_SIZES_VALUE}; do

@@ -195,6 +195,8 @@ Muon knobs; override `SWEEP_SPECS` with entries like `attn:3:64`, and set
 For list-layout models, set `MUON_GROUP_BLOCKS=0` to update each block layer
 directly instead of stacking same-name block weights inside the optimizer. This
 is the default in the TPU best-profile wrapper when `OPTIMIZER=muon`.
+Use `MODEL_KIND=b24c1024 bash sweep_jax_batches.sh` for a wider batch sweep of
+the smaller 24-layer model; override `BATCH_SIZES` to refine around a winner.
 Muon normally compiles as one train-step JIT so XLA can keep gradients inside
 the compiled program. If that compile stalls on a larger shape, set
 `MUON_SPLIT_JIT=1` as a slower fallback that compiles loss/grad and optimizer
