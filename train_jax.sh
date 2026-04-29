@@ -70,6 +70,9 @@ fi
 if [ "${REMAT_BLOCKS:-0}" != "0" ]; then
     EXTRA_FLAGS+=(--remat-blocks)
 fi
+if [ "${INT8_TRAIN:-0}" != "0" ]; then
+    EXTRA_FLAGS+=(--int8-train)
+fi
 
 MAX_TRAINING_SAMPLES_VALUE="${MAX_TRAINING_SAMPLES:-32768}"
 SAVE_EVERY_SAMPLES_VALUE="${SAVE_EVERY_SAMPLES:-${MAX_TRAINING_SAMPLES_VALUE}}"
@@ -111,6 +114,9 @@ python -u train_jax.py \
     --rope-dtype "${ROPE_DTYPE:-float32}" \
     --ffn-mul-dtype "${FFN_MUL_DTYPE:-float32}" \
     --attention-logits-dtype "${ATTENTION_LOGITS_DTYPE:-float32}" \
+    --int8-target "${INT8_TARGET:-ffn}" \
+    --int8-fwd-bits "${INT8_FWD_BITS:-8}" \
+    --int8-bwd-bits "${INT8_BWD_BITS:-8}" \
     --xla-peak-tflops "${XLA_PEAK_TFLOPS:-918}" \
     --allow-nonfull-mask \
     --seed "${SEED:-1234}" \

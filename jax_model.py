@@ -16,6 +16,32 @@ EXTRA_SCORE_DISTR_RADIUS = 60
 COMPUTE_DTYPE = jnp.bfloat16
 
 
+def make_int8_dot_general(fwd_bits=8, bwd_bits=8):
+    try:
+        import aqt.jax.v2.aqt_dot_general as aqt_dot_general
+    except ModuleNotFoundError as exc:
+        if exc.name == "aqt":
+            raise ModuleNotFoundError(
+                "AQT is required for INT8_TRAIN=1. Install it with: "
+                "python -m pip install aqtp"
+            ) from exc
+        raise
+    return aqt_dot_general.dot_general_make(
+        lhs_bits=fwd_bits,
+        rhs_bits=fwd_bits,
+        bwd_bits=bwd_bits,
+    )
+
+
+def dot_for_target(dot_general, target, *groups):
+    if dot_general is None:
+        return None
+    target = str(target).lower()
+    if target == "all" or target in groups:
+        return dot_general
+    return None
+
+
 def dtype_from_name(name):
     normalized = str(name).lower()
     if normalized in ("float32", "fp32"):
@@ -65,10 +91,24 @@ def tree_index(tree, index):
     return tree[index]
 
 
-def linear(params, x, out_dtype=jnp.float32):
-    y = jnp.matmul(
+def _dot_last_dim(lhs, rhs, dot_general=None):
+    if dot_general is None:
+        return jnp.matmul(lhs, rhs)
+    dimension_numbers = (((lhs.ndim - 1,), (0,)), ((), ()))
+    return dot_general(
+        lhs,
+        rhs,
+        dimension_numbers,
+        precision=None,
+        preferred_element_type=COMPUTE_DTYPE,
+    )
+
+
+def linear(params, x, out_dtype=jnp.float32, dot_general=None):
+    y = _dot_last_dim(
         x.astype(COMPUTE_DTYPE),
         jnp.swapaxes(params["w"], -1, -2).astype(COMPUTE_DTYPE),
+        dot_general=dot_general,
     )
     if "b" in params:
         y = y.astype(jnp.float32) + params["b"]
@@ -136,6 +176,7 @@ def attention(
     attention_impl="manual",
     out_dtype=jnp.float32,
     logits_dtype=jnp.float32,
+    dot_general=None,
 ):
     # q,k,v: B,L,H,D
     if attention_impl == "xla":
@@ -153,15 +194,34 @@ def attention(
     k = jnp.transpose(k, (0, 2, 1, 3))
     v = jnp.transpose(v, (0, 2, 1, 3))
     scale = 1.0 / math.sqrt(q.shape[-1])
-    logits = jnp.einsum(
-        "bhld,bhmd->bhlm",
-        q.astype(COMPUTE_DTYPE),
-        k.astype(COMPUTE_DTYPE),
-    ).astype(logits_dtype) * jnp.asarray(scale, dtype=logits_dtype)
+    q = q.astype(COMPUTE_DTYPE)
+    k = k.astype(COMPUTE_DTYPE)
+    v = v.astype(COMPUTE_DTYPE)
+    if dot_general is None:
+        logits = jnp.einsum("bhld,bhmd->bhlm", q, k)
+    else:
+        logits = dot_general(
+            q,
+            k,
+            (((3,), (3,)), ((0, 1), (0, 1))),
+            precision=None,
+            preferred_element_type=COMPUTE_DTYPE,
+        )
+    logits = logits.astype(logits_dtype) * jnp.asarray(scale, dtype=logits_dtype)
     if mask is not None:
         logits = logits + mask.astype(logits_dtype)
     weights = jax.nn.softmax(logits, axis=-1).astype(COMPUTE_DTYPE)
-    out = jnp.einsum("bhlm,bhmd->bhld", weights, v.astype(COMPUTE_DTYPE)).astype(out_dtype)
+    if dot_general is None:
+        out = jnp.einsum("bhlm,bhmd->bhld", weights, v)
+    else:
+        out = dot_general(
+            weights,
+            v,
+            (((3,), (2,)), ((0, 1), (0, 1))),
+            precision=None,
+            preferred_element_type=COMPUTE_DTYPE,
+        )
+    out = out.astype(out_dtype)
     return jnp.transpose(out, (0, 2, 1, 3))
 
 
@@ -240,6 +300,8 @@ def transformer_block(
     rope_dtype=jnp.float32,
     ffn_mul_dtype=jnp.float32,
     attention_logits_dtype=jnp.float32,
+    int8_dot_general=None,
+    int8_target="none",
 ):
     bsz, seq_len, channels = x.shape
     head_dim = channels // num_heads
@@ -247,19 +309,21 @@ def transformer_block(
     with jax.named_scope("attn_norm"):
         x_norm = rms_norm(params["norm1"], x)
     with jax.named_scope("attn_qkv"):
+        attn_proj_dot = dot_for_target(int8_dot_general, int8_target, "attn", "attn_proj", "trunk")
         if "qkv_proj" in params:
-            qkv = linear(params["qkv_proj"], x_norm, out_dtype=activation_dtype)
+            qkv = linear(params["qkv_proj"], x_norm, out_dtype=activation_dtype, dot_general=attn_proj_dot)
             q, k, v = jnp.split(qkv, 3, axis=-1)
         else:
-            q = linear(params["q_proj"], x_norm, out_dtype=activation_dtype)
-            k = linear(params["k_proj"], x_norm, out_dtype=activation_dtype)
-            v = linear(params["v_proj"], x_norm, out_dtype=activation_dtype)
+            q = linear(params["q_proj"], x_norm, out_dtype=activation_dtype, dot_general=attn_proj_dot)
+            k = linear(params["k_proj"], x_norm, out_dtype=activation_dtype, dot_general=attn_proj_dot)
+            v = linear(params["v_proj"], x_norm, out_dtype=activation_dtype, dot_general=attn_proj_dot)
         q = q.reshape(bsz, seq_len, num_heads, head_dim)
         k = k.reshape(bsz, seq_len, num_heads, head_dim)
         v = v.reshape(bsz, seq_len, num_heads, head_dim)
     with jax.named_scope("attn_rope"):
         q, k = apply_rope(q, k, rope_cos, rope_sin, compute_dtype=rope_dtype)
     with jax.named_scope("attention"):
+        attn_core_dot = dot_for_target(int8_dot_general, int8_target, "attn", "attn_core", "trunk")
         attn_out = attention(
             q,
             k,
@@ -267,23 +331,35 @@ def transformer_block(
             attention_impl=attention_impl,
             out_dtype=activation_dtype,
             logits_dtype=attention_logits_dtype,
+            dot_general=attn_core_dot,
         ).reshape(bsz, seq_len, channels)
     with jax.named_scope("attn_out_proj"):
-        x = (x + linear(params["out_proj"], attn_out, out_dtype=activation_dtype)).astype(activation_dtype)
+        x = (x + linear(
+            params["out_proj"],
+            attn_out,
+            out_dtype=activation_dtype,
+            dot_general=attn_proj_dot,
+        )).astype(activation_dtype)
 
     with jax.named_scope("ffn_norm"):
         x_norm = rms_norm(params["norm2"], x)
     with jax.named_scope("ffn_upgate"):
+        ffn_dot = dot_for_target(int8_dot_general, int8_target, "ffn", "trunk")
         if "ffn_upgate" in params:
-            upgate = linear(params["ffn_upgate"], x_norm, out_dtype=activation_dtype)
+            upgate = linear(params["ffn_upgate"], x_norm, out_dtype=activation_dtype, dot_general=ffn_dot)
             w1, wg = jnp.split(upgate, 2, axis=-1)
             w1 = silu(w1)
         else:
-            w1 = silu(linear(params["ffn_w1"], x_norm, out_dtype=activation_dtype))
-            wg = linear(params["ffn_wgate"], x_norm, out_dtype=activation_dtype)
+            w1 = silu(linear(params["ffn_w1"], x_norm, out_dtype=activation_dtype, dot_general=ffn_dot))
+            wg = linear(params["ffn_wgate"], x_norm, out_dtype=activation_dtype, dot_general=ffn_dot)
         hidden = (w1.astype(ffn_mul_dtype) * wg.astype(ffn_mul_dtype)).astype(activation_dtype)
     with jax.named_scope("ffn_down"):
-        return (x + linear(params["ffn_w2"], hidden, out_dtype=activation_dtype)).astype(activation_dtype)
+        return (x + linear(
+            params["ffn_w2"],
+            hidden,
+            out_dtype=activation_dtype,
+            dot_general=ffn_dot,
+        )).astype(activation_dtype)
 
 
 def forward_stem(
@@ -293,6 +369,8 @@ def forward_stem(
     config,
     pos_len,
     activation_dtype=jnp.float32,
+    int8_dot_general=None,
+    int8_target="none",
 ):
     c = config["hidden_size"]
     n = binary_input.shape[0]
@@ -300,7 +378,8 @@ def forward_stem(
 
     with jax.named_scope("stem"):
         x_spatial = conv2d_nchw(params["conv_spatial"], binary_input, out_dtype=activation_dtype)
-        x_global = linear(params["linear_global"], global_input, out_dtype=activation_dtype)
+        stem_dot = dot_for_target(int8_dot_general, int8_target, "stem")
+        x_global = linear(params["linear_global"], global_input, out_dtype=activation_dtype, dot_general=stem_dot)
         x = (x_spatial + x_global[:, :, None, None]).astype(activation_dtype)
         return jnp.transpose(x.reshape(n, c, seq_len), (0, 2, 1))
 
@@ -317,6 +396,8 @@ def forward_trunk(
     rope_dtype=jnp.float32,
     ffn_mul_dtype=jnp.float32,
     attention_logits_dtype=jnp.float32,
+    int8_dot_general=None,
+    int8_target="none",
 ):
     num_heads = config["num_heads"]
 
@@ -334,6 +415,8 @@ def forward_trunk(
             rope_dtype=rope_dtype,
             ffn_mul_dtype=ffn_mul_dtype,
             attention_logits_dtype=attention_logits_dtype,
+            int8_dot_general=int8_dot_general,
+            int8_target=int8_target,
         )
 
     if remat_blocks:
@@ -355,14 +438,15 @@ def forward_trunk(
         return rms_norm(params["norm_final"], x).astype(jnp.float32)
 
 
-def forward_heads(params, x, pos_len):
+def forward_heads(params, x, pos_len, int8_dot_general=None, int8_target="none"):
     n = x.shape[0]
-    board = jnp.transpose(linear(params["policy_head"]["linear_board"], x), (0, 2, 1))
+    head_dot = dot_for_target(int8_dot_general, int8_target, "heads")
+    board = jnp.transpose(linear(params["policy_head"]["linear_board"], x, dot_general=head_dot), (0, 2, 1))
     pooled = jnp.mean(x, axis=1)
-    pass_logits = linear(params["policy_head"]["linear_pass"], pooled)
+    pass_logits = linear(params["policy_head"]["linear_pass"], pooled, dot_general=head_dot)
     out_policy = jnp.concatenate([board, pass_logits[:, :, None]], axis=2)
 
-    spatial_global = linear(params["value_head"]["linear_sv"], x)
+    spatial_global = linear(params["value_head"]["linear_sv"], x, dot_general=head_dot)
     spatial = spatial_global[:, :, :8]
     global_feats = jnp.mean(spatial_global[:, :, 8:], axis=1)
     spatial = jnp.transpose(spatial, (0, 2, 1)).reshape(n, 8, pos_len, pos_len)
@@ -373,7 +457,10 @@ def forward_heads(params, x, pos_len):
     out_value = global_feats[:, 0:3]
     out_misc = global_feats[:, 3:13]
     out_moremisc = global_feats[:, 13:21]
-    out_scorebelief = jax.nn.log_softmax(linear(params["value_head"]["linear_s_simple"], pooled), axis=1)
+    out_scorebelief = jax.nn.log_softmax(
+        linear(params["value_head"]["linear_s_simple"], pooled, dot_general=head_dot),
+        axis=1,
+    )
 
     return (
         out_policy, out_value, out_misc, out_moremisc,
@@ -396,8 +483,19 @@ def forward(
     rope_dtype=jnp.float32,
     ffn_mul_dtype=jnp.float32,
     attention_logits_dtype=jnp.float32,
+    int8_dot_general=None,
+    int8_target="none",
 ):
-    x = forward_stem(params, binary_input, global_input, config, pos_len, activation_dtype)
+    x = forward_stem(
+        params,
+        binary_input,
+        global_input,
+        config,
+        pos_len,
+        activation_dtype,
+        int8_dot_general=int8_dot_general,
+        int8_target=int8_target,
+    )
     x = forward_trunk(
         params,
         x,
@@ -410,9 +508,17 @@ def forward(
         rope_dtype=rope_dtype,
         ffn_mul_dtype=ffn_mul_dtype,
         attention_logits_dtype=attention_logits_dtype,
+        int8_dot_general=int8_dot_general,
+        int8_target=int8_target,
     )
     with jax.named_scope("heads"):
-        return forward_heads(params, x, pos_len)
+        return forward_heads(
+            params,
+            x,
+            pos_len,
+            int8_dot_general=int8_dot_general,
+            int8_target=int8_target,
+        )
 
 
 def score_belief_offsets(pos_len):

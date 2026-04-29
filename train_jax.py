@@ -664,6 +664,11 @@ def main():
                         choices=["float32", "fp32", "bfloat16", "bf16"])
     parser.add_argument("--attention-logits-dtype", type=str, default="float32",
                         choices=["float32", "fp32", "bfloat16", "bf16"])
+    parser.add_argument("--int8-train", action="store_true")
+    parser.add_argument("--int8-target", type=str, default="ffn",
+                        choices=["none", "ffn", "attn", "attn_proj", "attn_core", "heads", "stem", "trunk", "all"])
+    parser.add_argument("--int8-fwd-bits", type=int, default=8)
+    parser.add_argument("--int8-bwd-bits", type=int, default=8)
     parser.add_argument("--log-grad-norm", action="store_true")
     parser.add_argument("--log-step-time", action="store_true")
     parser.add_argument("--component-profile", action="store_true")
@@ -687,6 +692,10 @@ def main():
         raise ValueError("--muon-row-split-size must be >= 0")
     if args.muon_polar_steps < 1 or args.muon_polar_steps > len(_POLAR_EXPRESS_COEFFS):
         raise ValueError(f"--muon-polar-steps must be between 1 and {len(_POLAR_EXPRESS_COEFFS)}")
+    if args.int8_fwd_bits < 2 or args.int8_fwd_bits > 8:
+        raise ValueError("--int8-fwd-bits must be between 2 and 8")
+    if args.int8_bwd_bits < 2 or args.int8_bwd_bits > 8:
+        raise ValueError("--int8-bwd-bits must be between 2 and 8")
     track_grad_norm = args.log_grad_norm or args.grad_clip_norm > 0
 
     try:
@@ -712,6 +721,12 @@ def main():
     rope_dtype = jax_model.dtype_from_name(args.rope_dtype)
     ffn_mul_dtype = jax_model.dtype_from_name(args.ffn_mul_dtype)
     attention_logits_dtype = jax_model.dtype_from_name(args.attention_logits_dtype)
+    int8_dot_general = None
+    if args.int8_train:
+        int8_dot_general = jax_model.make_int8_dot_general(
+            fwd_bits=args.int8_fwd_bits,
+            bwd_bits=args.int8_bwd_bits,
+        )
 
     os.makedirs(args.traindir, exist_ok=True)
     logging.basicConfig(
@@ -762,6 +777,21 @@ def main():
         expected_stacked_blocks = args.stack_blocks or args.scan_blocks
         if isinstance(state_params.get("blocks"), dict) != expected_stacked_blocks:
             raise ValueError(f"{checkpoint_path}: checkpoint block layout does not match --stack-blocks/--scan-blocks")
+        if bool(meta.get("int8_train", False)) != args.int8_train:
+            raise ValueError(
+                f"{checkpoint_path}: checkpoint int8_train={meta.get('int8_train', False)} does not match "
+                f"--int8-train={args.int8_train}; set NO_RESUME=1 when changing INT8 training"
+            )
+        if args.int8_train:
+            if meta.get("int8_target", "ffn") != args.int8_target:
+                raise ValueError(
+                    f"{checkpoint_path}: checkpoint int8_target={meta.get('int8_target', 'ffn')} does not match "
+                    f"--int8-target={args.int8_target}; set NO_RESUME=1 when changing INT8 target"
+                )
+            if int(meta.get("int8_fwd_bits", args.int8_fwd_bits)) != args.int8_fwd_bits:
+                raise ValueError(f"{checkpoint_path}: checkpoint int8_fwd_bits does not match --int8-fwd-bits")
+            if int(meta.get("int8_bwd_bits", args.int8_bwd_bits)) != args.int8_bwd_bits:
+                raise ValueError(f"{checkpoint_path}: checkpoint int8_bwd_bits does not match --int8-bwd-bits")
         params = jax.device_put(_tree_map(lambda x: jnp.asarray(x, dtype=param_dtype), state_params))
         opt_state = jax.device_put(_tree_map(lambda x: jnp.asarray(x, dtype=opt_state_dtype), state["opt_state"]))
         step = int(meta.get("step", 0))
@@ -802,7 +832,9 @@ def main():
                                     scan_blocks=args.scan_blocks,
                                     rope_dtype=rope_dtype,
                                     ffn_mul_dtype=ffn_mul_dtype,
-                                    attention_logits_dtype=attention_logits_dtype)
+                                    attention_logits_dtype=attention_logits_dtype,
+                                    int8_dot_general=int8_dot_general,
+                                    int8_target=args.int8_target)
         if args.loss_profile != "full":
             return jax_losses.profile_loss_core(
                 outputs,
@@ -979,6 +1011,15 @@ def main():
         forward_flops / 1e9,
         train_flops_per_sample / 1e9,
     )
+    if args.int8_train:
+        logging.info(
+            "AQT INT8 training enabled: target=%s, fwd_bits=%d, bwd_bits=%d. "
+            "Parameters and optimizer state remain floating point; only selected dot_general ops are quantized. "
+            "The standard TFLOPS/MFU logs still use model FLOPs and XLA_PEAK_TFLOPS, so compare samples/s too.",
+            args.int8_target,
+            args.int8_fwd_bits,
+            args.int8_bwd_bits,
+        )
     if args.optimizer == "muon":
         muon_update_flops = estimate_muon_update_flops(
             model_config,
@@ -1084,6 +1125,8 @@ def main():
                 model_config,
                 args.pos_len,
                 activation_dtype,
+                int8_dot_general=int8_dot_general,
+                int8_target=args.int8_target,
             )
 
         x_stem = time_component(
@@ -1106,12 +1149,22 @@ def main():
             bsz, seq_len, channels = x_norm_i.shape
             head_dim = channels // num_heads
             if "qkv_proj" in block_i:
-                qkv = jax_model.linear(block_i["qkv_proj"], x_norm_i, out_dtype=activation_dtype)
+                qkv = jax_model.linear(
+                    block_i["qkv_proj"],
+                    x_norm_i,
+                    out_dtype=activation_dtype,
+                    dot_general=jax_model.dot_for_target(
+                        int8_dot_general, args.int8_target, "attn", "attn_proj", "trunk"
+                    ),
+                )
                 q, k, v = jnp.split(qkv, 3, axis=-1)
             else:
-                q = jax_model.linear(block_i["q_proj"], x_norm_i, out_dtype=activation_dtype)
-                k = jax_model.linear(block_i["k_proj"], x_norm_i, out_dtype=activation_dtype)
-                v = jax_model.linear(block_i["v_proj"], x_norm_i, out_dtype=activation_dtype)
+                attn_proj_dot = jax_model.dot_for_target(
+                    int8_dot_general, args.int8_target, "attn", "attn_proj", "trunk"
+                )
+                q = jax_model.linear(block_i["q_proj"], x_norm_i, out_dtype=activation_dtype, dot_general=attn_proj_dot)
+                k = jax_model.linear(block_i["k_proj"], x_norm_i, out_dtype=activation_dtype, dot_general=attn_proj_dot)
+                v = jax_model.linear(block_i["v_proj"], x_norm_i, out_dtype=activation_dtype, dot_general=attn_proj_dot)
             return (
                 q.reshape(bsz, seq_len, num_heads, head_dim),
                 k.reshape(bsz, seq_len, num_heads, head_dim),
@@ -1141,6 +1194,9 @@ def main():
                 attention_impl=args.attention_impl,
                 out_dtype=activation_dtype,
                 logits_dtype=attention_logits_dtype,
+                dot_general=jax_model.dot_for_target(
+                    int8_dot_general, args.int8_target, "attn", "attn_core", "trunk"
+                ),
             ).reshape(bsz, seq_len, heads * head_dim)
 
         attn_out = time_component(
@@ -1154,7 +1210,14 @@ def main():
         x_attn = time_component(
             "block0_out_proj_residual",
             lambda block_i, x_i, attn_i: (
-                x_i + jax_model.linear(block_i["out_proj"], attn_i, out_dtype=activation_dtype)
+                x_i + jax_model.linear(
+                    block_i["out_proj"],
+                    attn_i,
+                    out_dtype=activation_dtype,
+                    dot_general=jax_model.dot_for_target(
+                        int8_dot_general, args.int8_target, "attn", "attn_proj", "trunk"
+                    ),
+                )
             ).astype(activation_dtype),
             block0,
             x_stem,
@@ -1169,13 +1232,21 @@ def main():
         )
 
         def ffn_upgate_fn(block_i, x_norm_i):
+            ffn_dot = jax_model.dot_for_target(int8_dot_general, args.int8_target, "ffn", "trunk")
             if "ffn_upgate" in block_i:
-                upgate = jax_model.linear(block_i["ffn_upgate"], x_norm_i, out_dtype=activation_dtype)
+                upgate = jax_model.linear(
+                    block_i["ffn_upgate"],
+                    x_norm_i,
+                    out_dtype=activation_dtype,
+                    dot_general=ffn_dot,
+                )
                 w1, wg = jnp.split(upgate, 2, axis=-1)
                 w1 = jax_model.silu(w1)
             else:
-                w1 = jax_model.silu(jax_model.linear(block_i["ffn_w1"], x_norm_i, out_dtype=activation_dtype))
-                wg = jax_model.linear(block_i["ffn_wgate"], x_norm_i, out_dtype=activation_dtype)
+                w1 = jax_model.silu(jax_model.linear(
+                    block_i["ffn_w1"], x_norm_i, out_dtype=activation_dtype, dot_general=ffn_dot
+                ))
+                wg = jax_model.linear(block_i["ffn_wgate"], x_norm_i, out_dtype=activation_dtype, dot_general=ffn_dot)
             return (w1.astype(ffn_mul_dtype) * wg.astype(ffn_mul_dtype)).astype(activation_dtype)
 
         hidden = time_component(
@@ -1188,7 +1259,12 @@ def main():
         _ = time_component(
             "block0_ffn_down_residual",
             lambda block_i, x_i, hidden_i: (
-                x_i + jax_model.linear(block_i["ffn_w2"], hidden_i, out_dtype=activation_dtype)
+                x_i + jax_model.linear(
+                    block_i["ffn_w2"],
+                    hidden_i,
+                    out_dtype=activation_dtype,
+                    dot_general=jax_model.dot_for_target(int8_dot_general, args.int8_target, "ffn", "trunk"),
+                )
             ).astype(activation_dtype),
             block0,
             x_attn,
@@ -1208,6 +1284,8 @@ def main():
                 rope_dtype=rope_dtype,
                 ffn_mul_dtype=ffn_mul_dtype,
                 attention_logits_dtype=attention_logits_dtype,
+                int8_dot_general=int8_dot_general,
+                int8_target=args.int8_target,
             ),
             block0,
             x_stem,
@@ -1227,6 +1305,8 @@ def main():
                 rope_dtype=rope_dtype,
                 ffn_mul_dtype=ffn_mul_dtype,
                 attention_logits_dtype=attention_logits_dtype,
+                int8_dot_general=int8_dot_general,
+                int8_target=args.int8_target,
             ),
             params,
             x_stem,
@@ -1234,7 +1314,13 @@ def main():
         )
         _ = time_component(
             "heads_fwd",
-            lambda params_i, x_i: jax_model.forward_heads(params_i, x_i, args.pos_len),
+            lambda params_i, x_i: jax_model.forward_heads(
+                params_i,
+                x_i,
+                args.pos_len,
+                int8_dot_general=int8_dot_general,
+                int8_target=args.int8_target,
+            ),
             params,
             x_trunk,
             flops_per_sample=component_flops["heads_fwd"],
@@ -1255,6 +1341,8 @@ def main():
                 rope_dtype=rope_dtype,
                 ffn_mul_dtype=ffn_mul_dtype,
                 attention_logits_dtype=attention_logits_dtype,
+                int8_dot_general=int8_dot_general,
+                int8_target=args.int8_target,
             ),
             params,
             batch,
@@ -1419,6 +1507,10 @@ def main():
             "rope_dtype": args.rope_dtype,
             "ffn_mul_dtype": args.ffn_mul_dtype,
             "attention_logits_dtype": args.attention_logits_dtype,
+            "int8_train": args.int8_train,
+            "int8_target": args.int8_target,
+            "int8_fwd_bits": args.int8_fwd_bits,
+            "int8_bwd_bits": args.int8_bwd_bits,
             "donate_train_buffers": args.donate_train_buffers,
             "stack_blocks": args.stack_blocks or args.scan_blocks,
             "scan_blocks": args.scan_blocks,

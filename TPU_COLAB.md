@@ -494,6 +494,27 @@ For the widest `c2048` shapes, also try `ROPE_DTYPE=bf16`,
 `FFN_MUL_DTYPE=bf16`, and `ATTENTION_LOGITS_DTYPE=bf16`. These reduce fp32
 elementwise work in RoPE, SwiGLU, and manual-attention logits, respectively,
 so compare both speed and loss behavior.
+Experimental AQT INT8 training is available as an opt-in probe. Install the
+optional AQT package first:
+
+```bash
+INSTALL_AQT=1 bash colab_install_jax_tpu.sh
+```
+
+Then quantize selected JAX `dot_general` operations during training:
+
+```bash
+INT8_TRAIN=1 INT8_TARGET=ffn NO_RESUME=1 bash train_jax_best_tpu.sh
+```
+
+`INT8_TARGET` can be `none`, `ffn`, `attn`, `attn_proj`, `attn_core`, `heads`,
+`stem`, `trunk`, or `all`. `INT8_FWD_BITS` and `INT8_BWD_BITS` default to `8`.
+Parameters and optimizer state remain floating point; AQT
+quantizes the selected matmul inputs in forward/backward and updates latent
+floating-point weights. Use this as a throughput/quality A/B and compare
+samples/s, not only MFU, because the default MFU denominator is still the BF16
+TPU peak unless `XLA_PEAK_TFLOPS` is overridden.
+
 The recommended public single-chip TPU v6e profile is packaged as
 `NO_RESUME=1 bash train_jax_best_tpu.sh`: `b24c1024`, `BATCH_SIZE=16`,
 attention-only Muon, full BF16 storage/activations, BF16 RoPE/SwiGLU/attention

@@ -13,8 +13,17 @@ else
         -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 fi
 
+if [ "${INSTALL_AQT:-0}" != "0" ]; then
+    python -m pip install -U aqtp
+fi
+
 python - <<'PY'
 import jax
 print("jax", jax.__version__)
 print("devices", jax.devices())
+try:
+    import aqt  # noqa: F401
+    print("aqt installed")
+except ModuleNotFoundError:
+    print("aqt not installed; set INSTALL_AQT=1 to enable INT8_TRAIN=1 experiments")
 PY
