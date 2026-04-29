@@ -8,7 +8,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 if [ "${OPTIMIZER:-adamw}" = "muon" ]; then
-    export MUON_ROW_SPLIT_SIZE="${MUON_ROW_SPLIT_SIZE:-128}"
+    export MUON_ROW_SPLIT_SIZE="${MUON_ROW_SPLIT_SIZE:-64}"
+    export MUON_GROUP_BLOCKS="${MUON_GROUP_BLOCKS:-0}"
 fi
 
 MODEL_KIND="${MODEL_KIND:-b24c2048}" \
