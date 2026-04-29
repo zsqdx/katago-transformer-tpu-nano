@@ -1,13 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-# Convenience wrapper for searching batch size around the current best
-# single-chip TPU shape.
+# Convenience wrapper for searching batch size around the recommended
+# single-chip TPU Muon profile.
 
 cd "$(dirname "$0")"
 
-MODEL_KIND_VALUE="${MODEL_KIND:-b24c2048}"
-OPTIMIZER_VALUE="${OPTIMIZER:-adamw}"
+MODEL_KIND_VALUE="${MODEL_KIND:-b24c1024}"
+OPTIMIZER_VALUE="${OPTIMIZER:-muon}"
 if [ "${OPTIMIZER_VALUE}" = "muon" ]; then
     export MUON_TARGET="${MUON_TARGET:-attn}"
     export MUON_POLAR_STEPS="${MUON_POLAR_STEPS:-3}"

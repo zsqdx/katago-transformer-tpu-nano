@@ -9,10 +9,11 @@ training loop can be iterated on independently.
 ## Current Status
 
 - CUDA training remains the primary, more complete path.
-- TPU support is an initial single-device smoke-test path via `--device xla`.
-- A separate JAX TPU prototype is available for direct PyTorch/XLA vs JAX/XLA
-  throughput comparisons on the same data and model presets.
-- The TPU path is intended for Colab `v6e-1` first, using AdamW only.
+- PyTorch/XLA TPU support remains an initial single-device smoke-test path via
+  `--device xla`.
+- The JAX TPU path is the current single-chip TPU performance path for Colab
+  `v6e-1`; the public default uses a full-BF16 `b24c1024` profile with
+  attention-only Muon.
 - TransformerEngine, FP8, CUDA profiling, ZeRO, multi-GPU DDP, and
   `torch.compile` are not enabled on XLA yet.
 - Colab TPU v6e-1 smoke test has passed with Python 3.12,
@@ -101,10 +102,11 @@ the default `b12c192`.
 
 The JAX path is intended for performance A/B testing after the PyTorch/XLA
 baseline shows low TPU utilization. It currently supports the fixed-board
-real-data path, AdamW, warmup+cosine LR, history matrices, X/Y/T symmetries,
-BF16 matmul/conv compute, `score_mode=simple`, validation, automatic resume,
-and pickle checkpoints. It does not yet implement multi-device sharding,
-variable-size board masks, or the `mixop` score-belief head.
+real-data path, AdamW/Muon, warmup+cosine LR, history matrices, X/Y/T
+symmetries, BF16 matmul/conv compute, `score_mode=simple`, validation,
+automatic resume, and pickle checkpoints. It does not yet implement
+multi-device sharding, variable-size board masks, or the `mixop` score-belief
+head.
 
 In a Colab TPU runtime:
 
@@ -112,21 +114,16 @@ In a Colab TPU runtime:
 cd KataGo_Transformer-TPU/nano
 bash colab_install_jax_tpu.sh
 
-MODEL_KIND=b12c2048 \
-BATCH_SIZE=16 \
-MAX_TRAINING_SAMPLES=32768 \
-WARMUP_SAMPLES=4096 \
-TRAINDIR=./jax_tpu_run_b12c2048_b16 \
-bash train_jax.sh
+NO_RESUME=1 bash train_jax_best_tpu.sh
 ```
 
 If the stable windows after the first compile land far above the PyTorch/XLA
 run, the next migration step is making the JAX path the default TPU runner and
 then filling in the remaining feature gaps.
 
-For deeper/narrower presets such as `b24c1024`, try `STEPS_PER_JIT=4` or `8`
-to execute several optimizer steps per XLA call. This reduces per-step dispatch
-overhead without changing the per-sample LR schedule or checkpoint semantics.
+For `b24c1024`, the public profile keeps `STEPS_PER_JIT=1`; short sweeps found
+`4` and `8` did not improve stable MFU. Use larger chunks only as a dispatch
+overhead A/B because they change how often Python synchronizes with the TPU.
 Projection layers are separate by default because early TPU A/B runs showed the
 fused QKV/SwiGLU layout was slower for `b24c1024`; set `FUSE_PROJECTIONS=1`
 only for that A/B. To test JAX/XLA's built-in attention lowering:
@@ -169,21 +166,22 @@ More granular BF16 probes are available for the current TPU bottlenecks:
 the SwiGLU gate product in BF16, and `ATTENTION_LOGITS_DTYPE=bf16` runs the
 manual-attention softmax logits in BF16. These are profiling switches because
 they can affect numerical behavior.
-The current best single-chip TPU v6e profile from short sweeps is available as
-`bash train_jax_best_tpu.sh`: `b24c2048`, `BATCH_SIZE=24`, full BF16
-storage/activations, BF16 RoPE/SwiGLU/attention logits, and train-buffer
-donation. In short-window sweeps it reached about 43.5% MFU, but longer runs
-should still validate training quality.
-When `OPTIMIZER=muon` is used with this wrapper, the default short-sweep
-throughput profile is attention-only Muon with `MUON_POLAR_STEPS=3`,
-`MUON_ROW_SPLIT_SIZE=64`, and `MUON_GROUP_BLOCKS=0`.
-For `MODEL_KIND=b24c1024`, this wrapper defaults to `BATCH_SIZE=16`, which was
-the best short-sweep Muon batch on the single-chip TPU v6e run.
-Set `OPTIMIZER=muon` to use the original Muon-style split: transformer block
-matrix weights use Muon, while stem/head/norm parameters continue to use AdamW.
-The defaults match the PyTorch path (`MUON_LR_MULTIPLIER=0.2`,
-`MUON_MOMENTUM=0.95`). Use `NO_RESUME=1` when switching an existing JAX run
-between AdamW and Muon because the optimizer state layout differs.
+The recommended public single-chip TPU v6e profile is packaged as
+`NO_RESUME=1 bash train_jax_best_tpu.sh`: `b24c1024`, `BATCH_SIZE=16`,
+attention-only Muon, full BF16 storage/activations, BF16 RoPE/SwiGLU/attention
+logits, and train-buffer donation. In short-window sweeps this profile reached
+about 36.9% MFU and 453 samples/s. Longer runs should still validate training
+quality.
+The wrapper defaults to `OPTIMIZER=muon`, `MUON_TARGET=attn`,
+`MUON_POLAR_STEPS=3`, `MUON_ROW_SPLIT_SIZE=64`, and `MUON_GROUP_BLOCKS=0`.
+Stem/head/norm parameters continue to use AdamW, while targeted transformer
+block matrix weights use Muon. The defaults match the PyTorch Muon
+hyperparameters (`MUON_LR_MULTIPLIER=0.2`, `MUON_MOMENTUM=0.95`). Use
+`NO_RESUME=1` when switching an existing JAX run between AdamW and Muon because
+the optimizer state layout differs.
+For a wider AdamW throughput baseline, run
+`OPTIMIZER=adamw MODEL_KIND=b24c2048 BATCH_SIZE=24 NO_RESUME=1 bash train_jax_best_tpu.sh`;
+that short-sweep profile reached about 43.5% MFU.
 Muon's optimizer work is not included in the standard model-FLOPs MFU log, and
 full-matrix Muon on wide FFN weights can dominate wall time. Set
 `MUON_ROW_SPLIT_SIZE=256` to split large block matrices into row chunks before
@@ -197,9 +195,9 @@ Muon knobs; override `SWEEP_SPECS` with entries like `attn:3:64`, and set
 For list-layout models, set `MUON_GROUP_BLOCKS=0` to update each block layer
 directly instead of stacking same-name block weights inside the optimizer. This
 is the default in the TPU best-profile wrapper when `OPTIMIZER=muon`.
-Use `MODEL_KIND=b24c1024 bash sweep_jax_batches.sh` for a wider batch sweep of
-the smaller 24-layer model; override `BATCH_SIZES` to refine around a winner.
-Add `OPTIMIZER=muon` to sweep the current attention-Muon TPU profile.
+Use `bash sweep_jax_batches.sh` to reproduce the default `b24c1024`
+attention-Muon batch search; override `BATCH_SIZES` to refine around a winner.
+Set `OPTIMIZER=adamw MODEL_KIND=b24c2048` to sweep the wider AdamW baseline.
 Muon normally compiles as one train-step JIT so XLA can keep gradients inside
 the compiled program. If that compile stalls on a larger shape, set
 `MUON_SPLIT_JIT=1` as a slower fallback that compiles loss/grad and optimizer
@@ -239,9 +237,12 @@ each candidate. The sweep disables final checkpoint saves to keep the search
 fast and disk-light.
 Set `SWEEP_FAST_BF16=1` to sweep with the current fast TPU profile
 (`ROPE_DTYPE=bf16`, `FFN_MUL_DTYPE=bf16`, `ATTENTION_LOGITS_DTYPE=bf16`, and
-`DONATE_TRAIN_BUFFERS=1`). To sweep batch size around one model, run
-`bash sweep_jax_batches.sh`; override with `MODEL_KIND=b24c2048` and
-`BATCH_SIZES="16 20 22 24 26 28 32"`.
+`DONATE_TRAIN_BUFFERS=1`). To sweep batch size around the public Muon default,
+run `bash sweep_jax_batches.sh`. For the wider AdamW baseline, run:
+
+```bash
+MODEL_KIND=b24c2048 OPTIMIZER=adamw BATCH_SIZES="16 20 22 24 26 28 32" bash sweep_jax_batches.sh
+```
 
 ## CUDA Training Example
 

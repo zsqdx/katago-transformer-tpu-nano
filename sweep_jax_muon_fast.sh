@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Fast Muon knob sweep for the current best single-chip TPU shape. Each spec is:
+# Fast Muon knob sweep for the recommended single-chip TPU shape. Each spec is:
 #   MUON_TARGET:MUON_POLAR_STEPS:MUON_ROW_SPLIT_SIZE
 #
 # This intentionally runs only a tiny training window. It is for throughput
@@ -14,8 +14,12 @@ SWEEP_SPECS="${SWEEP_SPECS:-attn:5:128 attn:3:64 all:3:64 all:5:32 ffn:3:32 none
 SWEEP_SKIP_WINDOWS="${SWEEP_SKIP_WINDOWS:-1}"
 SWEEP_TEE="${SWEEP_TEE:-1}"
 
-MODEL_KIND_VALUE="${MODEL_KIND:-b24c2048}"
-BATCH_SIZE_VALUE="${BATCH_SIZE:-24}"
+MODEL_KIND_VALUE="${MODEL_KIND:-b24c1024}"
+BATCH_SIZE_DEFAULT="24"
+if [ "${MODEL_KIND_VALUE}" = "b24c1024" ]; then
+    BATCH_SIZE_DEFAULT="16"
+fi
+BATCH_SIZE_VALUE="${BATCH_SIZE:-${BATCH_SIZE_DEFAULT}}"
 MAX_TRAINING_SAMPLES_VALUE="${MAX_TRAINING_SAMPLES:-960}"
 WARMUP_SAMPLES_VALUE="${WARMUP_SAMPLES:-480}"
 PRINT_EVERY_VALUE="${PRINT_EVERY:-20}"
