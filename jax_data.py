@@ -5,6 +5,7 @@ run the loader after installing jax[tpu].
 """
 
 import glob
+import json
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -14,8 +15,51 @@ import numpy as np
 import configs
 
 
+def _files_from_index(split_dir):
+    index_path = os.path.join(split_dir, "index.json")
+    if not os.path.exists(index_path):
+        return []
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            index = json.load(f)
+    except Exception as exc:
+        logging.warning("Could not read %s: %s", index_path, exc)
+        return []
+
+    entries = index.get("files", [])
+    files = []
+    for entry in entries:
+        if isinstance(entry, str):
+            name = entry
+        elif isinstance(entry, dict):
+            name = (
+                entry.get("name")
+                or entry.get("path")
+                or entry.get("file")
+                or entry.get("filename")
+            )
+        else:
+            name = None
+        if not name:
+            continue
+        path = name if os.path.isabs(name) else os.path.join(split_dir, name)
+        if path.endswith(".npz") and os.path.exists(path):
+            files.append(path)
+
+    return sorted(files)
+
+
 def list_npz_files(data_dir, split):
-    return sorted(glob.glob(os.path.join(data_dir, split, "*.npz")))
+    split_dir = os.path.join(data_dir, split)
+    direct = sorted(glob.glob(os.path.join(split_dir, "*.npz")))
+    if direct:
+        return direct
+
+    indexed = _files_from_index(split_dir)
+    if indexed:
+        return indexed
+
+    return sorted(glob.glob(os.path.join(split_dir, "**", "*.npz"), recursive=True))
 
 
 def sample_symmetry(symmetry_type, rand):

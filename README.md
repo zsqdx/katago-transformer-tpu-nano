@@ -134,7 +134,8 @@ It defaults to `DATADIR=/mnt/data/datasets/shuffle-2405-2604-zhizi/main`,
 `BATCH_SIZE=128` (per-device batch 16 on 8 local TPU devices), full BF16, and
 attention-only Muon. Checkpoints are written directly under `TRAINDIR`; leave
 `NO_RESUME` unset for spot-preemption recovery, or set `NO_RESUME=1` for a
-fresh run.
+fresh run. The JAX loader accepts both flat `train/*.npz` / `val/*.npz` layouts
+and sharded shuffle outputs such as `train/00000/...` plus `index.json`.
 
 For `b24c1024`, the public profile keeps `STEPS_PER_JIT=1`; short sweeps found
 `4` and `8` did not improve stable MFU. Use larger chunks only as a dispatch
