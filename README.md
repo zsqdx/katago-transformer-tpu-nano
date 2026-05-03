@@ -131,11 +131,13 @@ bash train_jax_zhizi_v6e8_b40c768.sh
 
 It defaults to `DATADIR=/mnt/data/datasets/shuffle-2405-2604-zhizi/main`,
 `TRAINDIR=/mnt/ckpt/runs/zhizi-v6e8-exp001`, `MODEL_KIND=b40c768`, global
-`BATCH_SIZE=128` (per-device batch 16 on 8 local TPU devices), full BF16, and
-attention-only Muon. Checkpoints are written directly under `TRAINDIR`; leave
-`NO_RESUME` unset for spot-preemption recovery, or set `NO_RESUME=1` for a
-fresh run. The JAX loader accepts both flat `train/*.npz` / `val/*.npz` layouts
-and sharded shuffle outputs such as `train/00000/...` plus `index.json`.
+`BATCH_SIZE=512` (per-device batch 64 on 8 local TPU devices), `LR=1e-4`,
+5,000,000,000 training samples, 32,000,000 warmup samples, full BF16,
+attention-only Muon, and `EMA_DECAY=0.999`. Checkpoints are written directly
+under `TRAINDIR`; leave `NO_RESUME` unset for spot-preemption recovery, or set
+`NO_RESUME=1` for a fresh run. The JAX loader accepts both flat `train/*.npz`
+/ `val/*.npz` layouts and sharded shuffle outputs such as `train/00000/...`
+plus `index.json`.
 
 For `b24c1024`, the public profile keeps `STEPS_PER_JIT=1`; short sweeps found
 `4` and `8` did not improve stable MFU. Use larger chunks only as a dispatch

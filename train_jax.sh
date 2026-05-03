@@ -120,6 +120,7 @@ python -u train_jax.py \
     --int8-target "${INT8_TARGET:-ffn}" \
     --int8-fwd-bits "${INT8_FWD_BITS:-8}" \
     --int8-bwd-bits "${INT8_BWD_BITS:-8}" \
+    --ema-decay "${EMA_DECAY:-0}" \
     --xla-peak-tflops "${XLA_PEAK_TFLOPS:-918}" \
     --allow-nonfull-mask \
     --seed "${SEED:-1234}" \

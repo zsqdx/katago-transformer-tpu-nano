@@ -586,7 +586,7 @@ def lr_wd_at_step(step, args, samples_per_step):
     return args.lr * mult, args.wd
 
 
-def save_checkpoint(path, params, opt_state, meta):
+def save_checkpoint(path, params, opt_state, meta, ema_params=None):
     import jax
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -595,6 +595,8 @@ def save_checkpoint(path, params, opt_state, meta):
         "opt_state": jax.device_get(opt_state),
         "meta": meta,
     }
+    if ema_params is not None:
+        host_state["ema_params"] = jax.device_get(ema_params)
     tmp_path = path + ".tmp"
     with open(tmp_path, "wb") as f:
         pickle.dump(host_state, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -698,6 +700,7 @@ def main():
                         choices=["none", "ffn", "attn", "attn_proj", "attn_core", "heads", "stem", "trunk", "all"])
     parser.add_argument("--int8-fwd-bits", type=int, default=8)
     parser.add_argument("--int8-bwd-bits", type=int, default=8)
+    parser.add_argument("--ema-decay", type=float, default=0.0)
     parser.add_argument("--log-grad-norm", action="store_true")
     parser.add_argument("--log-step-time", action="store_true")
     parser.add_argument("--component-profile", action="store_true")
@@ -726,6 +729,8 @@ def main():
         raise ValueError("--int8-fwd-bits must be between 2 and 8")
     if args.int8_bwd_bits < 2 or args.int8_bwd_bits > 8:
         raise ValueError("--int8-bwd-bits must be between 2 and 8")
+    if args.ema_decay < 0.0 or args.ema_decay >= 1.0:
+        raise ValueError("--ema-decay must be in [0, 1)")
     if args.data_parallel and args.component_profile:
         raise ValueError("--component-profile is currently single-device only; disable it with DATA_PARALLEL=1")
     if args.data_parallel and args.muon_split_jit:
@@ -811,6 +816,7 @@ def main():
 
     moving_sum = jnp.asarray(0.0, dtype=jnp.float32)
     moving_weight = jnp.asarray(0.0, dtype=jnp.float32)
+    ema_params = ()
     total_samples = 0
     step = 0
 
@@ -852,6 +858,13 @@ def main():
                 raise ValueError(f"{checkpoint_path}: checkpoint int8_bwd_bits does not match --int8-bwd-bits")
         params = _tree_map(lambda x: jnp.asarray(x, dtype=param_dtype), state_params)
         opt_state = _tree_map(lambda x: jnp.asarray(x, dtype=opt_state_dtype), state["opt_state"])
+        if args.ema_decay > 0:
+            if "ema_params" in state:
+                ema_params = _tree_map(lambda x: jnp.asarray(x, dtype=jnp.float32), state["ema_params"])
+                logging.info("EMA state loaded")
+            else:
+                ema_params = _tree_map(lambda x: jnp.asarray(x, dtype=jnp.float32), params)
+                logging.info("EMA enabled but checkpoint has no EMA state; initialized from params")
         step = int(meta.get("step", 0))
         total_samples = int(meta.get("samples", 0))
         moving_sum = jnp.asarray(float(meta.get("moving_sum", 0.0)), dtype=jnp.float32)
@@ -877,15 +890,22 @@ def main():
             )
         else:
             opt_state = init_adam_state(params, dtype=opt_state_dtype)
+        if args.ema_decay > 0:
+            ema_params = _tree_map(lambda x: jnp.asarray(x, dtype=jnp.float32), params)
+            logging.info("EMA enabled: decay=%.6f", args.ema_decay)
 
     if args.data_parallel:
         params = jax.device_put_replicated(params, data_parallel_devices)
         opt_state = jax.device_put_replicated(opt_state, data_parallel_devices)
+        if args.ema_decay > 0:
+            ema_params = jax.device_put_replicated(ema_params, data_parallel_devices)
         moving_sum = jax.device_put_replicated(moving_sum, data_parallel_devices)
         moving_weight = jax.device_put_replicated(moving_weight, data_parallel_devices)
     else:
         params = jax.device_put(params)
         opt_state = jax.device_put(opt_state)
+        if args.ema_decay > 0:
+            ema_params = jax.device_put(ema_params)
         moving_sum = jax.device_put(moving_sum)
         moving_weight = jax.device_put(moving_weight)
 
@@ -994,9 +1014,19 @@ def main():
             raise ValueError(f"Unknown optimizer: {args.optimizer}")
         return new_params, new_opt_state, new_moving_sum, new_moving_weight, metrics, grad_norm
 
+    def update_ema_params(ema_params_, params_):
+        decay = jnp.asarray(args.ema_decay, dtype=jnp.float32)
+        one_minus_decay = jnp.asarray(1.0 - args.ema_decay, dtype=jnp.float32)
+        return _tree_map(
+            lambda ema, p: decay * ema.astype(jnp.float32) + one_minus_decay * p.astype(jnp.float32),
+            ema_params_,
+            params_,
+        )
+
     def train_steps_impl(
         params_,
         opt_state_,
+        ema_params_,
         batches_,
         moving_sum_,
         moving_weight_,
@@ -1006,7 +1036,7 @@ def main():
         data_axis_name=None,
     ):
         def body(carry, xs):
-            params_i, opt_state_i, moving_sum_i, moving_weight_i = carry
+            params_i, opt_state_i, ema_params_i, moving_sum_i, moving_weight_i = carry
             batch_i, opt_step_i, lr_i, wd_i = xs
             params_i, opt_state_i, moving_sum_i, moving_weight_i, metrics_i, grad_norm_i = train_one_step(
                 params_i,
@@ -1019,16 +1049,19 @@ def main():
                 wd_i,
                 data_axis_name=data_axis_name,
             )
-            return (params_i, opt_state_i, moving_sum_i, moving_weight_i), (metrics_i, grad_norm_i)
+            if args.ema_decay > 0:
+                ema_params_i = update_ema_params(ema_params_i, params_i)
+            return (params_i, opt_state_i, ema_params_i, moving_sum_i, moving_weight_i), (metrics_i, grad_norm_i)
 
-        (params_, opt_state_, moving_sum_, moving_weight_), (metrics_seq, grad_norm_seq) = jax.lax.scan(
+        (params_, opt_state_, ema_params_, moving_sum_, moving_weight_), (metrics_seq, grad_norm_seq) = jax.lax.scan(
             body,
-            (params_, opt_state_, moving_sum_, moving_weight_),
+            (params_, opt_state_, ema_params_, moving_sum_, moving_weight_),
             (batches_, opt_steps, lrs, wds),
         )
         return (
             params_,
             opt_state_,
+            ema_params_,
             moving_sum_,
             moving_weight_,
             jnp.sum(metrics_seq, axis=0),
@@ -1037,15 +1070,19 @@ def main():
 
     if args.donate_train_buffers:
         train_donate_argnums = (0, 1) if args.optimizer in ("adamw", "muon") else (0,)
+        if args.ema_decay > 0:
+            train_donate_argnums = train_donate_argnums + (2,)
     else:
         train_donate_argnums = ()
     train_steps = jax.jit(train_steps_impl, donate_argnums=train_donate_argnums)
     train_steps_dp = None
     if args.data_parallel:
+        ema_in_axes = 0 if args.ema_decay > 0 else None
         train_steps_dp = jax.pmap(
-            lambda params_, opt_state_, batches_, moving_sum_, moving_weight_, opt_steps, lrs, wds: train_steps_impl(
+            lambda params_, opt_state_, ema_params_, batches_, moving_sum_, moving_weight_, opt_steps, lrs, wds: train_steps_impl(
                 params_,
                 opt_state_,
+                ema_params_,
                 batches_,
                 moving_sum_,
                 moving_weight_,
@@ -1055,7 +1092,7 @@ def main():
                 data_axis_name="data",
             ),
             axis_name="data",
-            in_axes=(0, 0, 0, 0, 0, None, None, None),
+            in_axes=(0, 0, ema_in_axes, 0, 0, 0, None, None, None),
             donate_argnums=train_donate_argnums,
         )
 
@@ -1079,6 +1116,7 @@ def main():
         return grads, new_moving_sum, new_moving_weight, metrics, grad_norm
 
     loss_grad_step = jax.jit(loss_grad_step_impl)
+    ema_update_step = jax.jit(update_ema_params) if args.ema_decay > 0 else None
 
     def muon_update_step_impl(params_, opt_state_, grads_, opt_step, lr, wd):
         return muon_adamw_update(
@@ -1627,6 +1665,8 @@ def main():
             "log_step_time": args.log_step_time,
             "moving_sum": float(jax.device_get(moving_sum_for_meta)),
             "moving_weight": float(jax.device_get(moving_weight_for_meta)),
+            "ema_decay": args.ema_decay,
+            "ema_dtype": "float32" if args.ema_decay > 0 else "none",
             "data_parallel": args.data_parallel,
             "data_parallel_devices": num_data_parallel_devices,
             "per_device_batch": per_device_batch,
@@ -1713,7 +1753,7 @@ def main():
         log_metric_summary("  VAL", total_samples, metrics_host, val_count)
 
     def run_training_chunk(batch_list):
-        nonlocal params, opt_state, moving_sum, moving_weight
+        nonlocal params, opt_state, ema_params, moving_sum, moving_weight
         nonlocal running_metrics, running_grad_norm, step, total_samples
         chunk_start = time.perf_counter()
         start_step = step
@@ -1748,6 +1788,8 @@ def main():
                     jnp.asarray(lrs[i], dtype=jnp.float32),
                     jnp.asarray(wds[i], dtype=jnp.float32),
                 )
+                if args.ema_decay > 0:
+                    ema_params = ema_update_step(ema_params, params)
                 metrics = metrics + metrics_i
                 grad_norm = grad_norm + grad_norm_i
         else:
@@ -1761,9 +1803,10 @@ def main():
                     ),
                     data_parallel_devices,
                 )
-                params, opt_state, moving_sum, moving_weight, metrics, grad_norm = train_steps_dp(
+                params, opt_state, ema_params, moving_sum, moving_weight, metrics, grad_norm = train_steps_dp(
                     params,
                     opt_state,
+                    ema_params,
                     batch,
                     moving_sum,
                     moving_weight,
@@ -1775,9 +1818,10 @@ def main():
                 grad_norm = first_replica(grad_norm)
             else:
                 batch = jax.device_put(stacked_batch)
-                params, opt_state, moving_sum, moving_weight, metrics, grad_norm = train_steps(
+                params, opt_state, ema_params, moving_sum, moving_weight, metrics, grad_norm = train_steps(
                     params,
                     opt_state,
+                    ema_params,
                     batch,
                     moving_sum,
                     moving_weight,
@@ -1874,6 +1918,9 @@ def main():
                 first_replica(params) if args.data_parallel else params,
                 first_replica(opt_state) if args.data_parallel else opt_state,
                 checkpoint_meta(),
+                ema_params=(
+                    first_replica(ema_params) if args.data_parallel else ema_params
+                ) if args.ema_decay > 0 else None,
             )
             logging.info("Saved checkpoint at step %d, %d samples", step, total_samples)
             last_print_time += time.perf_counter() - save_start
@@ -1923,6 +1970,9 @@ def main():
             first_replica(params) if args.data_parallel else params,
             first_replica(opt_state) if args.data_parallel else opt_state,
             checkpoint_meta(),
+            ema_params=(
+                first_replica(ema_params) if args.data_parallel else ema_params
+            ) if args.ema_decay > 0 else None,
         )
         logging.info("Saved checkpoint at step %d, %d samples", step, total_samples)
     elif args.no_final_save and total_samples > last_save_samples:
