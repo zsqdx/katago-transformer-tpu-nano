@@ -11,9 +11,9 @@ training loop can be iterated on independently.
 - CUDA training remains the primary, more complete path.
 - PyTorch/XLA TPU support remains an initial single-device smoke-test path via
   `--device xla`.
-- The JAX TPU path is the current single-chip TPU performance path for Colab
-  `v6e-1`; the public default uses a full-BF16 `b24c1024` profile with
-  attention-only Muon.
+- The JAX TPU path is the current TPU performance path. It supports the
+  single-chip Colab `v6e-1` profile and single-process `pmap` data parallel
+  training on local multi-chip TPU VMs such as `v6e-8`.
 - TransformerEngine, FP8, CUDA profiling, ZeRO, multi-GPU DDP, and
   `torch.compile` are not enabled on XLA yet.
 - Colab TPU v6e-1 smoke test has passed with Python 3.12,
@@ -33,6 +33,7 @@ training loop can be iterated on independently.
 - `make_smoke_data.py`: tiny synthetic data generator for smoke tests.
 - `train_tpu_colab_smoke.sh`: Colab TPU v6e-1 smoke-test runner.
 - `train_jax.sh`: real-data JAX TPU prototype runner.
+- `train_jax_zhizi_v6e8_b40c768.sh`: data-parallel v6e-8 Zhizi experiment runner.
 - `TPU_COLAB.md`: Colab setup and TPU test notes.
 
 ## Quick CPU Smoke Test
@@ -94,9 +95,9 @@ environment overrides.
 
 Available TPU width presets include `b12c512`, `b12c768`, `b12c1024`,
 `b12c1536`, `b12c1792`, `b8c2048`, `b10c2048`, `b12c2048`, `b14c2048`,
-`b16c1536`, `b16c2048`, `b18c2048`, `b20c2048`, `b22c2048`, `b24c2048`, and
-`b24c1024` for checking whether a wider trunk improves TPU utilization over
-the default `b12c192`.
+`b16c1536`, `b16c2048`, `b18c2048`, `b20c2048`, `b22c2048`, `b24c2048`,
+`b24c1024`, and `b40c768` for checking whether a wider trunk improves TPU
+utilization over the default `b12c192`.
 
 ## JAX TPU Prototype
 
@@ -105,8 +106,8 @@ baseline shows low TPU utilization. It currently supports the fixed-board
 real-data path, AdamW/Muon, warmup+cosine LR, history matrices, X/Y/T
 symmetries, BF16 matmul/conv compute, `score_mode=simple`, validation,
 automatic resume, and pickle checkpoints. It does not yet implement
-multi-device sharding, variable-size board masks, or the `mixop` score-belief
-head.
+model sharding, multi-host sharding, variable-size board masks, or the `mixop`
+score-belief head.
 
 In a Colab TPU runtime:
 
@@ -120,6 +121,20 @@ NO_RESUME=1 bash train_jax_best_tpu.sh
 If the stable windows after the first compile land far above the PyTorch/XLA
 run, the next migration step is making the JAX path the default TPU runner and
 then filling in the remaining feature gaps.
+
+For the Zhizi `v6e-8` spot/GCS experiment, use the dedicated data-parallel
+entrypoint:
+
+```bash
+bash train_jax_zhizi_v6e8_b40c768.sh
+```
+
+It defaults to `DATADIR=/mnt/data/datasets/shuffle-2405-2604-zhizi/main`,
+`TRAINDIR=/mnt/ckpt/runs/zhizi-v6e8-exp001`, `MODEL_KIND=b40c768`, global
+`BATCH_SIZE=128` (per-device batch 16 on 8 local TPU devices), full BF16, and
+attention-only Muon. Checkpoints are written directly under `TRAINDIR`; leave
+`NO_RESUME` unset for spot-preemption recovery, or set `NO_RESUME=1` for a
+fresh run.
 
 For `b24c1024`, the public profile keeps `STEPS_PER_JIT=1`; short sweeps found
 `4` and `8` did not improve stable MFU. Use larger chunks only as a dispatch

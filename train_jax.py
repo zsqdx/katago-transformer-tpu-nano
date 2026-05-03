@@ -613,6 +613,35 @@ def stack_batch_list(batch_list):
     }
 
 
+def shard_batch_for_data_parallel(batch, num_devices, per_device_batch):
+    return [
+        _tree_map(
+            lambda x, device_idx=device_idx: np.asarray(x)[
+                device_idx * per_device_batch:(device_idx + 1) * per_device_batch
+            ],
+            batch,
+        )
+        for device_idx in range(num_devices)
+    ]
+
+
+def shard_stacked_batches_for_data_parallel(batch, num_devices, per_device_batch):
+    return [
+        _tree_map(
+            lambda x, device_idx=device_idx: np.asarray(x)[
+                :,
+                device_idx * per_device_batch:(device_idx + 1) * per_device_batch,
+            ],
+            batch,
+        )
+        for device_idx in range(num_devices)
+    ]
+
+
+def first_replica(tree):
+    return _tree_map(lambda x: x[0], tree)
+
+
 def main():
     global jax_losses, jax_model
 
@@ -675,6 +704,7 @@ def main():
     parser.add_argument("--component-profile-repeats", type=int, default=3)
     parser.add_argument("--component-profile-grad", action="store_true")
     parser.add_argument("--donate-train-buffers", action="store_true")
+    parser.add_argument("--data-parallel", action="store_true")
     parser.add_argument("--muon-split-jit", action="store_true")
     parser.add_argument("--stack-blocks", action="store_true")
     parser.add_argument("--scan-blocks", action="store_true")
@@ -696,6 +726,10 @@ def main():
         raise ValueError("--int8-fwd-bits must be between 2 and 8")
     if args.int8_bwd_bits < 2 or args.int8_bwd_bits > 8:
         raise ValueError("--int8-bwd-bits must be between 2 and 8")
+    if args.data_parallel and args.component_profile:
+        raise ValueError("--component-profile is currently single-device only; disable it with DATA_PARALLEL=1")
+    if args.data_parallel and args.muon_split_jit:
+        raise ValueError("--muon-split-jit is not supported with --data-parallel")
     track_grad_norm = args.log_grad_norm or args.grad_clip_norm > 0
 
     try:
@@ -739,6 +773,30 @@ def main():
     )
     logging.info("Args: %s", vars(args))
     logging.info("JAX devices: %s", jax.devices())
+    data_parallel_devices = tuple(jax.local_devices()) if args.data_parallel else ()
+    num_data_parallel_devices = len(data_parallel_devices)
+    per_device_batch = args.batch_size
+    if args.data_parallel:
+        if num_data_parallel_devices < 1:
+            raise RuntimeError("--data-parallel requested, but JAX reported no local devices")
+        if args.batch_size % num_data_parallel_devices != 0:
+            raise ValueError(
+                f"--batch-size={args.batch_size} must be divisible by local device count "
+                f"{num_data_parallel_devices} when --data-parallel is enabled"
+            )
+        per_device_batch = args.batch_size // num_data_parallel_devices
+        logging.info(
+            "Data parallel enabled: local_devices=%d, global_batch=%d, per_device_batch=%d",
+            num_data_parallel_devices,
+            args.batch_size,
+            per_device_batch,
+        )
+        if num_data_parallel_devices > 1 and args.xla_peak_tflops <= 1000.0:
+            logging.warning(
+                "XLA_PEAK_TFLOPS=%.1f looks like a single-chip peak. "
+                "For v6e-8 MFU, set XLA_PEAK_TFLOPS to the aggregate peak, e.g. 7344.",
+                args.xla_peak_tflops,
+            )
 
     if args.model_kind not in configs.config_of_name:
         raise ValueError(f"Unknown model kind {args.model_kind}")
@@ -792,8 +850,8 @@ def main():
                 raise ValueError(f"{checkpoint_path}: checkpoint int8_fwd_bits does not match --int8-fwd-bits")
             if int(meta.get("int8_bwd_bits", args.int8_bwd_bits)) != args.int8_bwd_bits:
                 raise ValueError(f"{checkpoint_path}: checkpoint int8_bwd_bits does not match --int8-bwd-bits")
-        params = jax.device_put(_tree_map(lambda x: jnp.asarray(x, dtype=param_dtype), state_params))
-        opt_state = jax.device_put(_tree_map(lambda x: jnp.asarray(x, dtype=opt_state_dtype), state["opt_state"]))
+        params = _tree_map(lambda x: jnp.asarray(x, dtype=param_dtype), state_params)
+        opt_state = _tree_map(lambda x: jnp.asarray(x, dtype=opt_state_dtype), state["opt_state"])
         step = int(meta.get("step", 0))
         total_samples = int(meta.get("samples", 0))
         moving_sum = jnp.asarray(float(meta.get("moving_sum", 0.0)), dtype=jnp.float32)
@@ -811,15 +869,25 @@ def main():
             stack_blocks=args.stack_blocks or args.scan_blocks,
         )
         params = _tree_map(lambda x: x.astype(param_dtype), params)
-        params = jax.device_put(params)
         if args.optimizer == "muon":
-            opt_state = jax.device_put(init_muon_adamw_state(
+            opt_state = init_muon_adamw_state(
                 params,
                 dtype=opt_state_dtype,
                 muon_target=args.muon_target,
-            ))
+            )
         else:
-            opt_state = jax.device_put(init_adam_state(params, dtype=opt_state_dtype))
+            opt_state = init_adam_state(params, dtype=opt_state_dtype)
+
+    if args.data_parallel:
+        params = jax.device_put_replicated(params, data_parallel_devices)
+        opt_state = jax.device_put_replicated(opt_state, data_parallel_devices)
+        moving_sum = jax.device_put_replicated(moving_sum, data_parallel_devices)
+        moving_weight = jax.device_put_replicated(moving_weight, data_parallel_devices)
+    else:
+        params = jax.device_put(params)
+        opt_state = jax.device_put(opt_state)
+        moving_sum = jax.device_put(moving_sum)
+        moving_weight = jax.device_put(moving_weight)
 
     td_value_loss_scales = (0.6, 0.6, 0.6)
 
@@ -859,7 +927,17 @@ def main():
             td_value_loss_scales=td_value_loss_scales,
         )
 
-    def train_one_step(params_, opt_state_, batch_, moving_sum_, moving_weight_, opt_step, lr, wd):
+    def train_one_step(
+        params_,
+        opt_state_,
+        batch_,
+        moving_sum_,
+        moving_weight_,
+        opt_step,
+        lr,
+        wd,
+        data_axis_name=None,
+    ):
         def scalar_loss(p):
             loss, metrics, new_moving_sum, new_moving_weight = loss_fn(
                 p, batch_, moving_sum_, moving_weight_, True
@@ -869,6 +947,12 @@ def main():
         (loss, (metrics, new_moving_sum, new_moving_weight)), grads = jax.value_and_grad(
             scalar_loss, has_aux=True
         )(params_)
+        if data_axis_name is not None:
+            grads = jax.lax.pmean(grads, data_axis_name)
+            metrics_sum = jax.lax.psum(metrics, data_axis_name)
+            metrics = metrics_sum.at[0].set(metrics_sum[0] / num_data_parallel_devices)
+            new_moving_sum = jax.lax.pmean(new_moving_sum, data_axis_name)
+            new_moving_weight = jax.lax.pmean(new_moving_weight, data_axis_name)
         if track_grad_norm:
             grad_norm = jnp.sqrt(_tree_sum_squares(grads))
         else:
@@ -910,7 +994,17 @@ def main():
             raise ValueError(f"Unknown optimizer: {args.optimizer}")
         return new_params, new_opt_state, new_moving_sum, new_moving_weight, metrics, grad_norm
 
-    def train_steps_impl(params_, opt_state_, batches_, moving_sum_, moving_weight_, opt_steps, lrs, wds):
+    def train_steps_impl(
+        params_,
+        opt_state_,
+        batches_,
+        moving_sum_,
+        moving_weight_,
+        opt_steps,
+        lrs,
+        wds,
+        data_axis_name=None,
+    ):
         def body(carry, xs):
             params_i, opt_state_i, moving_sum_i, moving_weight_i = carry
             batch_i, opt_step_i, lr_i, wd_i = xs
@@ -923,6 +1017,7 @@ def main():
                 opt_step_i,
                 lr_i,
                 wd_i,
+                data_axis_name=data_axis_name,
             )
             return (params_i, opt_state_i, moving_sum_i, moving_weight_i), (metrics_i, grad_norm_i)
 
@@ -945,6 +1040,24 @@ def main():
     else:
         train_donate_argnums = ()
     train_steps = jax.jit(train_steps_impl, donate_argnums=train_donate_argnums)
+    train_steps_dp = None
+    if args.data_parallel:
+        train_steps_dp = jax.pmap(
+            lambda params_, opt_state_, batches_, moving_sum_, moving_weight_, opt_steps, lrs, wds: train_steps_impl(
+                params_,
+                opt_state_,
+                batches_,
+                moving_sum_,
+                moving_weight_,
+                opt_steps,
+                lrs,
+                wds,
+                data_axis_name="data",
+            ),
+            axis_name="data",
+            in_axes=(0, 0, 0, 0, 0, None, None, None),
+            donate_argnums=train_donate_argnums,
+        )
 
     def loss_grad_step_impl(params_, batch_, moving_sum_, moving_weight_):
         def scalar_loss(p):
@@ -994,6 +1107,19 @@ def main():
     def eval_step(params_, batch_, moving_sum_, moving_weight_):
         _, metrics, _, _ = loss_fn(params_, batch_, moving_sum_, moving_weight_, False)
         return metrics
+
+    eval_step_dp = None
+    if args.data_parallel:
+        def eval_step_dp_impl(params_, batch_, moving_sum_, moving_weight_):
+            _, metrics, _, _ = loss_fn(params_, batch_, moving_sum_, moving_weight_, False)
+            metrics_sum = jax.lax.psum(metrics, "data")
+            return metrics_sum.at[0].set(metrics_sum[0] / num_data_parallel_devices)
+
+        eval_step_dp = jax.pmap(
+            eval_step_dp_impl,
+            axis_name="data",
+            in_axes=(0, 0, 0, 0),
+        )
 
     train_files = jax_data.list_npz_files(args.datadir, "train")
     if not train_files:
@@ -1481,6 +1607,8 @@ def main():
     last_val_samples = total_samples
 
     def checkpoint_meta():
+        moving_sum_for_meta = first_replica(moving_sum) if args.data_parallel else moving_sum
+        moving_weight_for_meta = first_replica(moving_weight) if args.data_parallel else moving_weight
         return {
             "step": step,
             "samples": total_samples,
@@ -1497,8 +1625,11 @@ def main():
             "loss_profile": args.loss_profile,
             "score_mode": args.score_mode,
             "log_step_time": args.log_step_time,
-            "moving_sum": float(jax.device_get(moving_sum)),
-            "moving_weight": float(jax.device_get(moving_weight)),
+            "moving_sum": float(jax.device_get(moving_sum_for_meta)),
+            "moving_weight": float(jax.device_get(moving_weight_for_meta)),
+            "data_parallel": args.data_parallel,
+            "data_parallel_devices": num_data_parallel_devices,
+            "per_device_batch": per_device_batch,
             "fuse_projections": args.fuse_projections and not args.separate_projections,
             "attention_impl": args.attention_impl,
             "activation_dtype": args.activation_dtype,
@@ -1555,8 +1686,24 @@ def main():
         )):
             if args.max_val_batches > 0 and val_batch_idx >= args.max_val_batches:
                 break
-            batch = jax.device_put(batch_np)
-            val_metrics = val_metrics + eval_step(params, batch, moving_sum, moving_weight)
+            if args.data_parallel:
+                batch = jax.device_put_sharded(
+                    shard_batch_for_data_parallel(
+                        batch_np,
+                        num_data_parallel_devices,
+                        per_device_batch,
+                    ),
+                    data_parallel_devices,
+                )
+                val_metrics = val_metrics + first_replica(eval_step_dp(
+                    params,
+                    batch,
+                    moving_sum,
+                    moving_weight,
+                ))
+            else:
+                batch = jax.device_put(batch_np)
+                val_metrics = val_metrics + eval_step(params, batch, moving_sum, moving_weight)
             val_count += 1
 
         if val_count == 0:
@@ -1604,17 +1751,40 @@ def main():
                 metrics = metrics + metrics_i
                 grad_norm = grad_norm + grad_norm_i
         else:
-            batch = jax.device_put(stack_batch_list(batch_list))
-            params, opt_state, moving_sum, moving_weight, metrics, grad_norm = train_steps(
-                params,
-                opt_state,
-                batch,
-                moving_sum,
-                moving_weight,
-                jnp.asarray(opt_steps),
-                jnp.asarray(lrs),
-                jnp.asarray(wds),
-            )
+            stacked_batch = stack_batch_list(batch_list)
+            if args.data_parallel:
+                batch = jax.device_put_sharded(
+                    shard_stacked_batches_for_data_parallel(
+                        stacked_batch,
+                        num_data_parallel_devices,
+                        per_device_batch,
+                    ),
+                    data_parallel_devices,
+                )
+                params, opt_state, moving_sum, moving_weight, metrics, grad_norm = train_steps_dp(
+                    params,
+                    opt_state,
+                    batch,
+                    moving_sum,
+                    moving_weight,
+                    jnp.asarray(opt_steps),
+                    jnp.asarray(lrs),
+                    jnp.asarray(wds),
+                )
+                metrics = first_replica(metrics)
+                grad_norm = first_replica(grad_norm)
+            else:
+                batch = jax.device_put(stacked_batch)
+                params, opt_state, moving_sum, moving_weight, metrics, grad_norm = train_steps(
+                    params,
+                    opt_state,
+                    batch,
+                    moving_sum,
+                    moving_weight,
+                    jnp.asarray(opt_steps),
+                    jnp.asarray(lrs),
+                    jnp.asarray(wds),
+                )
         if args.log_step_time:
             metrics.block_until_ready()
             train_wait_elapsed = time.perf_counter() - exec_start
@@ -1699,7 +1869,12 @@ def main():
 
         if total_samples - last_save_samples >= save_every:
             save_start = time.perf_counter()
-            save_checkpoint(checkpoint_path, params, opt_state, checkpoint_meta())
+            save_checkpoint(
+                checkpoint_path,
+                first_replica(params) if args.data_parallel else params,
+                first_replica(opt_state) if args.data_parallel else opt_state,
+                checkpoint_meta(),
+            )
             logging.info("Saved checkpoint at step %d, %d samples", step, total_samples)
             last_print_time += time.perf_counter() - save_start
             last_save_samples = total_samples
@@ -1743,7 +1918,12 @@ def main():
             break
 
     if not args.no_final_save and total_samples > last_save_samples:
-        save_checkpoint(checkpoint_path, params, opt_state, checkpoint_meta())
+        save_checkpoint(
+            checkpoint_path,
+            first_replica(params) if args.data_parallel else params,
+            first_replica(opt_state) if args.data_parallel else opt_state,
+            checkpoint_meta(),
+        )
         logging.info("Saved checkpoint at step %d, %d samples", step, total_samples)
     elif args.no_final_save and total_samples > last_save_samples:
         logging.info("Final checkpoint skipped by --no-final-save")

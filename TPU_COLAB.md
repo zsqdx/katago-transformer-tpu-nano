@@ -432,8 +432,9 @@ exists, matching `train.sh` for smoke runs. The prototype currently supports
 fixed-board training, AdamW/Muon, warmup+cosine LR, host-side history matrices
 and symmetry augmentation, BF16 matmul/conv compute, `score_mode=simple`,
 validation, automatic resume, and pickle checkpoints. It intentionally does
-not yet include multi-device sharding, variable-board masks, or
-`score_mode=mixop`.
+not yet include model sharding, multi-host sharding, variable-board masks, or
+`score_mode=mixop`. Single-process `pmap` data parallelism is available for
+local multi-chip TPU VMs.
 
 Judge the run by stable post-compile windows. If JAX removes the repeated
 compile and host-transfer stalls, the next useful step is making it the main
